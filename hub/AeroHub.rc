@@ -1,0 +1,2 @@
+// The lowest icon id is the one Explorer and the Start menu show for the exe.
+1 ICON "AeroHub.ico"
