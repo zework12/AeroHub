@@ -39,6 +39,18 @@ std::vector<GameProfile> LoadProfiles(const std::filesystem::path& dir, std::vec
         p.note = ReadKey(file, L"BuildNote");
         p.hotkeys = ReadKey(file, L"Hotkeys");
         p.steamAppId = ReadKey(file, L"SteamAppId");
+        if (ReadKey(file, L"Kind") == L"FabricMod") {
+            p.kind = GameKind::FabricMod;
+            p.modFile = ReadKey(file, L"ModFile");
+            p.gameVersion = ReadKey(file, L"GameVersion");
+            if (p.processName.empty()) p.processName = L"javaw.exe";
+            if (!p.name.empty() && !p.modFile.empty() && !p.gameVersion.empty()) {
+                result.push_back(std::move(p));
+            } else {
+                errors.push_back(it->path().filename().wstring() + L": a FabricMod profile needs Name, ModFile, GameVersion");
+            }
+            continue;
+        }
         const bool ok = !p.name.empty() && !p.processName.empty() && !p.moduleDll.empty() &&
                         ParseU32(ReadKey(file, L"ExpectedTimeDateStamp"), p.timeDateStamp) &&
                         ParseU32(ReadKey(file, L"ExpectedSizeOfImage"), p.sizeOfImage);

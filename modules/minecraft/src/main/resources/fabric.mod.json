@@ -1,0 +1,21 @@
+{
+	"schemaVersion": 1,
+	"id": "aeroclient",
+	"version": "${version}",
+	"name": "AeroClient",
+	"description": "Client-side utility mod for Minecraft Java: modules, click GUI, commands and the AutoMine pathfinder.",
+	"authors": ["AeroHub"],
+	"license": "All-Rights-Reserved",
+	"icon": "assets/aeroclient/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["dev.aero.client.AeroClient"]
+	},
+	"mixins": ["aeroclient.mixins.json"],
+	"depends": {
+		"fabricloader": ">=0.16.0",
+		"minecraft": "~1.21.1",
+		"java": ">=21",
+		"fabric-api": "*"
+	}
+}

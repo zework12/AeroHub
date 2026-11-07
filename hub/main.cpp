@@ -24,6 +24,7 @@
 
 #include "Inject.hpp"
 #include "Ipc.hpp"
+#include "Minecraft.hpp"
 #include "Pe.hpp"
 #include "Process.hpp"
 #include "Profile.hpp"
@@ -50,6 +51,7 @@ enum class Level { Idle, Ready, Active, Bad };
 
 struct Status {
     std::wstring text;  // long explanation
+    std::wstring word;  // short state for the sidebar and the pill; empty = the generic word for the level
     Level level = Level::Idle;
     bool canInject = false;
     DWORD pid = 0;
@@ -63,7 +65,7 @@ struct Link {
     Level level = Level::Idle;
 };
 
-enum class Act { None, SelectGame, Primary, Refresh, AutoSwitch, TabModule, TabHub };
+enum class Act { None, SelectGame, Primary, Secondary, Refresh, AutoSwitch, TabModule, TabHub };
 struct Hit {
     RectF r;
     Act act = Act::None;
@@ -78,6 +80,17 @@ HFONT g_editFont;
 int g_dpi = 96;
 std::filesystem::path g_dir, g_settingsFile;
 std::vector<aero::GameProfile> g_profiles;
+std::filesystem::path g_modrinthRoot;                 // AeroHub.ini [Hub] ModrinthRoot: a Modrinth data folder in a non-default place
+std::vector<std::filesystem::path> g_extraInstances;  // AeroHub.ini [Hub] MinecraftInstances: extra game folders, ';' separated
+
+// The Minecraft tab: what auto-detect found and where "Install mod" put the jar.
+struct McState {
+    bool found = false;
+    aero::mc::Detected game;
+    bool waiting = false;  // nothing found on disk: the hub watches for a running Minecraft process
+    std::wstring message;
+    std::filesystem::path savedJar;
+} g_mc;
 std::vector<Status> g_status;
 std::vector<DWORD> g_autoTriedPid;
 int g_sel = 0;
@@ -123,7 +136,13 @@ const wchar_t* LevelWord(Level l) {
     }
 }
 
+std::wstring StatusWord(std::size_t i);
+
 // ---------------------------------------------------------------- helpers (data)
+std::wstring StatusWord(std::size_t i) {
+    return i < g_status.size() && !g_status[i].word.empty() ? g_status[i].word : std::wstring(LevelWord(g_status[i].level));
+}
+
 std::wstring Hex(std::uint32_t v) {
     wchar_t b[16];
     swprintf_s(b, L"0x%X", v);
@@ -162,7 +181,88 @@ double ProcessAgeSeconds(DWORD pid) {
     return b.QuadPart > a.QuadPart ? static_cast<double>(b.QuadPart - a.QuadPart) / 1.0e7 : 0.0;
 }
 
+std::wstring LowerSlashes(std::wstring s) {
+    for (wchar_t& c : s) c = c == L'/' ? L'\\' : static_cast<wchar_t>(towlower(c));
+    while (!s.empty() && s.back() == L'\\') s.pop_back();
+    return s;
+}
+
+bool ProcessAlive(DWORD pid) {
+    aero::UniqueHandle h(OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    return h && WaitForSingleObject(h.get(), 0) == WAIT_TIMEOUT;
+}
+
+std::wstring GameLabel(const aero::mc::Detected& d) {
+    return d.profile.empty() ? d.launcher : d.launcher + L" \u00B7 " + d.profile;
+}
+
+// The Minecraft tab. Nothing is injected: the hub finds the game, reads the status file the mod writes, and says what is missing.
+Status EvaluateMinecraft(const aero::GameProfile& p) {
+    Status s;
+    const auto jar = g_dir / p.modFile;
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(jar, ec)) {
+        s.level = Level::Bad;
+        s.word = L"Jar missing";
+        s.text = L"aeroclient.jar is missing next to the hub";
+        return s;
+    }
+    if (!g_mc.found) {
+        s.level = g_mc.waiting ? Level::Ready : Level::Idle;
+        s.word = g_mc.waiting ? L"Waiting" : L"Not detected";
+        s.text = g_mc.message.empty() ? L"Press Auto-detect Minecraft" : g_mc.message;
+        return s;
+    }
+    const aero::mc::Live live = aero::mc::ReadLive(g_mc.game.dir);
+    const bool reporting = live.fresh && live.pid != 0 && ProcessAlive(live.pid);
+    DWORD runPid = 0;
+    bool compatible = true;
+    for (const aero::mc::Detected& r : aero::mc::RunningGames(p.gameVersion)) {
+        if (LowerSlashes(r.dir.wstring()) == LowerSlashes(g_mc.game.dir.wstring())) {
+            runPid = r.pid;
+            compatible = r.fabric121;
+            break;
+        }
+    }
+    s.pid = reporting ? live.pid : runPid;
+    if (reporting) {
+        s.level = Level::Active;
+        s.text = L"AeroClient is loaded in the running game";
+        return s;
+    }
+    const bool hasMod = aero::mc::HasMod(g_mc.game.dir);
+    if (runPid != 0) {
+        if (!compatible) {
+            s.level = Level::Ready;
+            s.word = L"Not Fabric " + p.gameVersion;
+            s.text = L"This game is not Fabric " + p.gameVersion + L": the mod will not load";
+        } else if (!hasMod) {
+            s.level = Level::Ready;
+            s.word = L"No mod";
+            s.text = L"Running without the mod: add it, then restart";
+        } else if (ProcessAgeSeconds(runPid) < 120.0) {
+            s.word = L"Starting";
+            s.text = L"The game is starting";
+        } else {
+            s.level = Level::Ready;
+            s.word = L"Restart needed";
+            s.text = L"The mod is in the mods folder but not loaded: restart";
+        }
+        return s;
+    }
+    if (hasMod) {
+        s.word = L"Mod added";
+        s.text = L"The mod is in the mods folder: start Minecraft";
+    } else {
+        s.level = Level::Ready;
+        s.word = L"No mod";
+        s.text = L"Install the mod and drop it into the mods folder";
+    }
+    return s;
+}
+
 Status Evaluate(const aero::GameProfile& p) {
+    if (p.kind == aero::GameKind::FabricMod) return EvaluateMinecraft(p);
     Status s;
     const auto dll = g_dir / p.moduleDll;
     std::error_code ec;
@@ -225,6 +325,20 @@ void UpdateChannel() {
         return;
     }
     const int sel = SelectedProfile();
+    if (sel >= 0 && g_profiles[sel].kind == aero::GameKind::FabricMod) {
+        g_client.Close();
+        g_clientPid = 0;
+        g_infoRows.clear();
+        g_link = {L"Offline", Level::Idle};
+        if (g_mc.found) {
+            const aero::mc::Live live = aero::mc::ReadLive(g_mc.game.dir);
+            if (live.fresh) {
+                g_link = {L"Live", Level::Active};
+                for (const auto& [k, v] : live.rows) g_infoRows.push_back({k, v});
+            }
+        }
+        return;
+    }
     const bool active = sel >= 0 && g_status[sel].level == Level::Active;
     g_link = {L"Offline", Level::Idle};
 
@@ -260,6 +374,101 @@ void UpdateChannel() {
             g_infoRows.push_back({FromUtf8(b->telemetry[i].name, sizeof(b->telemetry[i].name)),
                                   FromUtf8(b->telemetry[i].value, sizeof(b->telemetry[i].value))});
     }
+}
+
+const aero::GameProfile* McProfile() {
+    for (const aero::GameProfile& p : g_profiles)
+        if (p.kind == aero::GameKind::FabricMod) return &p;
+    return nullptr;
+}
+
+void SetDetected(const aero::mc::Detected& d, const wchar_t* how) {
+    g_mc.found = true;
+    g_mc.game = d;
+    g_mc.waiting = false;
+    g_mc.message.clear();
+    g_tailProfile = -2;  // makes the module log reopen on the new folder
+    WritePrivateProfileStringW(L"Minecraft", L"GameDir", d.dir.c_str(), g_settingsFile.c_str());
+    WritePrivateProfileStringW(L"Minecraft", L"Launcher", d.launcher.c_str(), g_settingsFile.c_str());
+    WritePrivateProfileStringW(L"Minecraft", L"Profile", d.profile.c_str(), g_settingsFile.c_str());
+    Log(L"Minecraft: found " + GameLabel(d) + L" (" + how + L") in " + d.dir.wstring());
+}
+
+void LoadMinecraftSettings() {
+    wchar_t dir[2048]{}, launcher[256]{}, profile[256]{};
+    GetPrivateProfileStringW(L"Minecraft", L"GameDir", L"", dir, static_cast<DWORD>(std::size(dir)), g_settingsFile.c_str());
+    GetPrivateProfileStringW(L"Minecraft", L"Launcher", L"", launcher, static_cast<DWORD>(std::size(launcher)), g_settingsFile.c_str());
+    GetPrivateProfileStringW(L"Minecraft", L"Profile", L"", profile, static_cast<DWORD>(std::size(profile)), g_settingsFile.c_str());
+    std::error_code ec;
+    if (dir[0] && std::filesystem::is_directory(dir, ec)) {
+        g_mc.found = true;
+        g_mc.game.dir = dir;
+        g_mc.game.launcher = launcher;
+        g_mc.game.profile = profile;
+    }
+}
+
+// A running game is the most exact answer (it is the folder the game really uses); otherwise the Modrinth App,
+// TLauncher and .minecraft are searched. When nothing is found the hub asks for the game to be started and keeps
+// looking at the running processes.
+void AutoDetect() {
+    const aero::GameProfile* p = McProfile();
+    if (!p) return;
+    const auto running = aero::mc::RunningGames(p->gameVersion);
+    if (!running.empty()) {
+        const aero::mc::Detected* pick = &running[0];
+        for (const auto& r : running) {
+            if (r.fabric121) {
+                pick = &r;
+                break;
+            }
+        }
+        SetDetected(*pick, L"running game");
+        if (running.size() > 1) Log(L"Minecraft: " + std::to_wstring(running.size()) + L" games are running; using the first one that is Fabric " + p->gameVersion);
+        return;
+    }
+    const auto installed = aero::mc::InstalledGames(g_modrinthRoot, p->gameVersion, g_extraInstances);
+    if (!installed.empty()) {
+        SetDetected(installed[0], L"on disk");
+        for (std::size_t i = 1; i < installed.size(); ++i) Log(L"Minecraft: also found " + GameLabel(installed[i]) + L" in " + installed[i].dir.wstring());
+        return;
+    }
+    g_mc.found = false;
+    g_mc.waiting = true;
+    g_mc.message = L"Not found: start Minecraft, the hub will find it";
+    Log(L"Minecraft: nothing found in the Modrinth App, TLauncher or .minecraft. Start Minecraft and the hub will find it through its process.");
+}
+
+void PollWaiting() {
+    if (!g_mc.waiting) return;
+    const aero::GameProfile* p = McProfile();
+    if (!p) return;
+    const auto running = aero::mc::RunningGames(p->gameVersion);
+    if (running.empty()) return;
+    const aero::mc::Detected* pick = &running[0];
+    for (const auto& r : running) {
+        if (r.fabric121) {
+            pick = &r;
+            break;
+        }
+    }
+    SetDetected(*pick, L"running game");
+}
+
+// "Install mod": the jar goes to the Downloads folder; the user drops it into the game's mods folder.
+void SaveMod() {
+    const aero::GameProfile* p = McProfile();
+    if (!p) return;
+    std::filesystem::path saved;
+    const std::wstring err = aero::mc::SaveToDownloads(g_dir / p->modFile, saved);
+    if (!err.empty()) {
+        Log(L"Minecraft: " + err);
+        return;
+    }
+    g_mc.savedJar = saved;
+    Log(L"Minecraft: the mod is saved as " + saved.wstring() + L". Drop it into the mods folder of your game" +
+        (g_mc.found ? L": " + (g_mc.game.dir / L"mods").wstring() : std::wstring(L".")));
+    ShellExecuteW(g_hwnd, L"open", L"explorer.exe", (L"/select,\"" + saved.wstring() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
 }
 
 void Refresh() {
@@ -306,15 +515,27 @@ PrimaryState GetPrimary() {
     const int sel = SelectedProfile();
     if (sel < 0) return {L"No game", false};
     const Status& s = g_status[sel];
+    if (g_profiles[sel].kind == aero::GameKind::FabricMod) return {L"Auto-detect Minecraft", true};
     if (s.canInject) return {L"Inject module", true};
     if (s.level == Level::Idle && s.pid == 0 && !g_profiles[sel].steamAppId.empty()) return {L"Launch game", true};
     if (s.level == Level::Active) return {L"Module active", false};
     return {L"Unavailable", false};
 }
 
+void DoSecondary() {
+    const int sel = SelectedProfile();
+    if (sel < 0 || g_profiles[sel].kind != aero::GameKind::FabricMod) return;
+    SaveMod();
+}
+
 void DoPrimary() {
     const int sel = SelectedProfile();
     if (sel < 0) return;
+    if (g_profiles[sel].kind == aero::GameKind::FabricMod) {
+        AutoDetect();
+        Refresh();
+        return;
+    }
     if (g_status[sel].canInject) {
         Inject(static_cast<std::size_t>(sel), false);
         Refresh();
@@ -346,8 +567,12 @@ void PollModuleLog() {
         g_tailPos = 0;
         g_tailPath.clear();
         if (sel >= 0) {
-            g_tailPath = g_dir / g_profiles[sel].moduleDll;
-            g_tailPath.replace_extension(L".log");
+            if (g_profiles[sel].kind == aero::GameKind::FabricMod) {
+                g_tailPath = g_mc.found ? g_mc.game.dir / L"logs" / L"latest.log" : std::filesystem::path();
+            } else {
+                g_tailPath = g_dir / g_profiles[sel].moduleDll;
+                g_tailPath.replace_extension(L".log");
+            }
             std::error_code ec;
             const auto size = std::filesystem::file_size(g_tailPath, ec);
             if (!ec && size > 6000) g_tailPos = size - 6000;  // start with the most recent lines
@@ -499,7 +724,7 @@ void DrawSidebar(Gdiplus::Graphics& g, const Lay& L) {
         const COLORREF c = LevelColor(g_status[i].level);
         FillDot(g, r.X + S(22), r.Y + r.Height / 2, S(5), c);
         DrawStr(g, g_profiles[i].name, *g_fBodyBold, RectF(r.X + S(40), r.Y + S(8), r.Width - S(48), S(22)), kText);
-        DrawStr(g, LevelWord(g_status[i].level), *g_fSmall, RectF(r.X + S(40), r.Y + S(30), r.Width - S(48), S(20)), kDim);
+        DrawStr(g, StatusWord(i), *g_fSmall, RectF(r.X + S(40), r.Y + S(30), r.Width - S(48), S(20)), kDim);
         AddHit(Act::SelectGame, static_cast<int>(i), r);
         y += S(62);
     }
@@ -527,20 +752,32 @@ void DrawHeader(Gdiplus::Graphics& g, const Lay& L) {
     const Status& st = g_status[sel];
     DrawStr(g, g_profiles[sel].name, *g_fTitle, RectF(h.X, h.Y, h.Width * 0.5f, S(36)), kText);
 
-    // Actions on the right: one primary, one secondary.
+    // Actions on the right. Minecraft has two (auto-detect, install mod); every other game has its primary action and Refresh.
     const PrimaryState prim = GetPrimary();
     const float bh = S(40);
-    const RectF refresh(h.X + h.Width - S(96), h.Y + S(2), S(96), bh);
-    const RectF primary(refresh.X - S(12) - S(176), h.Y + S(2), S(176), bh);
-    DrawButton(g, primary, prim.label, true, prim.enabled, IsHover(Act::Primary, 0), IsPressed(Act::Primary, 0));
-    DrawButton(g, refresh, L"Refresh", false, true, IsHover(Act::Refresh, 0), IsPressed(Act::Refresh, 0));
-    AddHit(Act::Primary, 0, primary, prim.enabled);
-    AddHit(Act::Refresh, 0, refresh);
+    float leftmost;
+    if (g_profiles[sel].kind == aero::GameKind::FabricMod) {
+        const RectF install(h.X + h.Width - S(150), h.Y + S(2), S(150), bh);
+        const RectF detect(install.X - S(12) - S(210), h.Y + S(2), S(210), bh);
+        DrawButton(g, detect, prim.label, true, prim.enabled, IsHover(Act::Primary, 0), IsPressed(Act::Primary, 0));
+        DrawButton(g, install, L"Install mod", false, true, IsHover(Act::Secondary, 0), IsPressed(Act::Secondary, 0));
+        AddHit(Act::Primary, 0, detect, prim.enabled);
+        AddHit(Act::Secondary, 0, install);
+        leftmost = detect.X;
+    } else {
+        const RectF refresh(h.X + h.Width - S(96), h.Y + S(2), S(96), bh);
+        const RectF primary(refresh.X - S(12) - S(176), h.Y + S(2), S(176), bh);
+        DrawButton(g, primary, prim.label, true, prim.enabled, IsHover(Act::Primary, 0), IsPressed(Act::Primary, 0));
+        DrawButton(g, refresh, L"Refresh", false, true, IsHover(Act::Refresh, 0), IsPressed(Act::Refresh, 0));
+        AddHit(Act::Primary, 0, primary, prim.enabled);
+        AddHit(Act::Refresh, 0, refresh);
+        leftmost = primary.X;
+    }
 
     // Status pill and details under the title.
     const float py = h.Y + S(44);
-    const float pw = DrawPill(g, h.X, py, LevelWord(st.level), LevelColor(st.level));
-    DrawStr(g, st.text, *g_fSmall, RectF(h.X + pw + S(14), py, max(S(100), primary.X - (h.X + pw + S(14)) - S(12)), S(26)), kDim);
+    const float pw = DrawPill(g, h.X, py, StatusWord(static_cast<std::size_t>(sel)), LevelColor(st.level));
+    DrawStr(g, st.text, *g_fSmall, RectF(h.X + pw + S(14), py, max(S(100), leftmost - (h.X + pw + S(14)) - S(12)), S(26)), kDim);
 }
 
 void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
@@ -549,13 +786,25 @@ void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
     DrawStr(g, L"In-game menu", *g_fH2, RectF(c.X + S(20), c.Y + S(14), c.Width - S(40), S(24)), kText);
     const int sel = SelectedProfile();
     const bool active = sel >= 0 && g_status[sel].level == Level::Active;
-    const std::wstring lead = active ? L"Cheats are switched in the game itself. Open its menu during a match."
-                                     : L"Launch the game and load the module; cheats are then switched in the game's own menu.";
+    const bool minecraft = sel >= 0 && g_profiles[sel].kind == aero::GameKind::FabricMod;
+    const std::wstring lead = minecraft ? (active ? L"AeroClient is loaded. Everything is switched in the game itself."
+                                          : g_mc.found ? L"Install the mod, drop it into the mods folder and start the game."
+                                                       : L"Press Auto-detect Minecraft. If it finds nothing, start the game.")
+                              : active   ? L"Cheats are switched in the game itself. Open its menu during a match."
+                                         : L"Launch the game and load the module; cheats are then switched in the game's own menu.";
     DrawStr(g, lead, *g_fBody, RectF(c.X + S(20), c.Y + S(50), c.Width - S(40), S(24)), kText);
 
-    if (sel < 0 || g_profiles[sel].hotkeys.empty()) return;
-    // One line per "|"-separated hint.
-    const std::wstring& hk = g_profiles[sel].hotkeys;
+    if (sel < 0) return;
+    // One line per "|"-separated hint. The Minecraft tab starts with what it knows about the game and the mod file.
+    std::wstring hk = g_profiles[sel].hotkeys;
+    if (minecraft) {
+        std::wstring info = g_mc.found ? L"Game: " + GameLabel(g_mc.game) + L"  |  Folder: " + g_mc.game.dir.wstring() + L"  |  Mod: " +
+                                             (aero::mc::HasMod(g_mc.game.dir) ? L"in the mods folder" : L"not in the mods folder yet")
+                                       : std::wstring(L"Game: not detected yet");
+        info += L"  |  Mod file: " + (g_mc.savedJar.empty() ? std::wstring(L"press Install mod to put it in Downloads") : g_mc.savedJar.wstring());
+        hk = info + (hk.empty() ? L"" : L"  |  " + hk);
+    }
+    if (hk.empty()) return;
     float y = c.Y + S(92);
     const float lh = S(34);
     Gdiplus::Pen sep(Col(kBorder), 1.0f);
@@ -671,6 +920,7 @@ void Perform(Act act, int idx) {
             }
             break;
         case Act::Primary: DoPrimary(); break;
+        case Act::Secondary: DoSecondary(); break;
         case Act::Refresh: Refresh(); break;
         case Act::AutoSwitch: g_autoInject = !g_autoInject; SaveSettings(); break;
         case Act::TabModule: g_tab = 0; PositionLogs(); break;
@@ -710,8 +960,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_autoInject = GetPrivateProfileIntW(L"Hub", L"AutoInject", 0, g_settingsFile.c_str()) != 0;
             std::vector<std::wstring> errors;
             g_profiles = aero::LoadProfiles(g_dir / L"profiles", errors);
+            wchar_t buf[2048]{};
+            GetPrivateProfileStringW(L"Hub", L"ModrinthRoot", L"", buf, static_cast<DWORD>(std::size(buf)), g_settingsFile.c_str());
+            g_modrinthRoot = buf;
+            GetPrivateProfileStringW(L"Hub", L"MinecraftInstances", L"", buf, static_cast<DWORD>(std::size(buf)), g_settingsFile.c_str());
+            for (std::size_t start = 0, len = wcslen(buf); start < len;) {
+                std::size_t end = std::wstring_view(buf, len).find(L';', start);
+                if (end == std::wstring_view::npos) end = len;
+                if (end > start) g_extraInstances.emplace_back(std::wstring(buf + start, end - start));
+                start = end + 1;
+            }
             Log(L"Loaded " + std::to_wstring(g_profiles.size()) + L" game profile(s).");
             for (const auto& e : errors) Log(L"profile skipped: " + e);
+            LoadMinecraftSettings();
+            if (!g_mc.found) AutoDetect();
             Refresh();
             PositionLogs();
             SetTimer(hwnd, kTimer, 1000, nullptr);
@@ -733,6 +995,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_TIMER:
+            PollWaiting();
             Refresh();
             AutoInject();
             PollModuleLog();

@@ -15,7 +15,7 @@
 | Игра | Статус |
 |---|---|
 | Forts | ✅ Готово |
-| Minecraft | 🗓 В планах |
+| Minecraft Java 1.21.1 | 🟡 Мод для Fabric: 114 модулей и автокопание руды, [подробнее](modules/minecraft/README.md) |
 
 Список будет расти.
 
@@ -23,6 +23,22 @@
   <img src="docs/hub.png" alt="Окно AeroHub" width="82%">
 </p>
 <p align="center"><sub>Окно хаба в режиме <code>--demo</code>, данные тестовые.</sub></p>
+
+## Minecraft
+
+<p align="center">
+  <img src="docs/mc-world.png" alt="AeroClient в игре" width="49%">
+  <img src="docs/mc-menu.png" alt="Меню модулей AeroClient" width="49%">
+</p>
+<p align="center">
+  <img src="docs/mc-xray.png" alt="X-Ray" width="32%">
+  <img src="docs/mc-automine.png" alt="Автокопание" width="32%">
+  <img src="docs/mc-filter.png" alt="Фильтр блоков" width="32%">
+</p>
+
+**AeroClient** — клиентский мод для Fabric 1.21.1. В игру ничего не внедряется: миксины применяются только при старте игры, поэтому это обычный мод. Вкладка **Minecraft** в хабе делает две вещи: **Auto-detect Minecraft** находит игру (запущенный процесс, Modrinth App, TLauncher, `.minecraft`), а **Install mod** кладёт мод в «Загрузки», откуда ты сам закидываешь его в папку `mods`. Когда игра загрузит мод, хаб показывает мир, позицию, FPS и включённые модули. В нём 114 модулей в шести категориях, меню на Right Shift или Insert, команды с точкой в чате настоящий **X-Ray** (камень исчезает, остаются руды; работает и со Sodium) и **автокопание руды**: фильтр блоков выбирается в меню (правый клик по AutoMine, строка Blocks) или командой `.mine diamond_ore`, мод находит руду рядом, строит самый быстрый путь (с прокопом через камень, где это быстрее обхода), показывает его в мире и на панели и добывает руду. Полный список модулей, правила и установка: [modules/minecraft/README.md](modules/minecraft/README.md).
+
+Мод и связь с хабом проверены запуском в самой игре: тест создаёт мир, гоняет автокопание в шести ситуациях и каждый модуль. Работу на чужих серверах и с шейдерами я не проверял, и серверы сами решают, принять ли действие игрока.
 
 ## Forts
 
@@ -113,6 +129,7 @@ cmake --build build --config Release
 | `core/` | Общая библиотека: чтение PE, поиск процесса, загрузка DLL, хуки IAT, связь с хабом, элементы интерфейса |
 | `hub/` | Приложение `AeroHub.exe` |
 | `modules/<game>/` | Модуль игры, сейчас `modules/forts/`: функции, меню и оверлей |
+| `modules/minecraft/` | Мод AeroClient для Minecraft Java на Fabric (отдельный проект Gradle). В хабе ему соответствует профиль `profiles/minecraft.ini` (`Kind=FabricMod`) |
 | `mods/aerohub/` | Мод Forts для сетевых матчей |
 | `profiles/` | Профили игр с ожидаемой сборкой и настройками |
 | `docs/` | Изображения для этого файла |

@@ -169,3 +169,74 @@ Fix: call with (0.1, -1) in `cfg::kOverrideNoExpiry` and in mods/aerohub/script.
 Mod updated in `data/mods/aerohub` and `users/.../WorkshopUploads/aerohub` (publishedfileid.lua kept). NOT yet uploaded to the Workshop.
 Both players must run the same mod version: an old and a new client would keep different overrides and desync.
 Verified online by the user's log: `AeroHub: team 101 ...` reached the mod. Long-lasting override not verified in game.
+
+## Update 18: AeroClient, Minecraft Java 1.21.1 client mod (modules/minecraft)
+
+Request: cheats for Minecraft with 100+ functions, in the spirit of the old Impact client, above all auto-mining: take an ore filter, find that ore nearby, plan the shortest path to it and dig.
+Chosen architecture (stated to the user): a Fabric client mod, not an injected DLL, because Minecraft Java has no native module to hook. It is loaded from the profile's `mods` folder. The hub does not launch or manage it yet.
+
+Measured / taken from artifacts:
+- Fabric Loader 0.20.1 and Fabric API 0.116.17+1.21.1 (matches the user's Modrinth profile "Fabric 1.21.1", which runs loader 0.19.5). Loom 1.15.5 because 1.19.x needs Java 25 to run the build; the mod itself targets Java 21 with Mojang mappings.
+- Toolchain on the D drive (C had 5 GB free): JDK 21 Temurin in `D:\dev\jdk21` (SHA-256 checked against the Adoptium API), Gradle home `D:\dev\gradle-home`, decompiled game sources in `D:\dev\mcsrc` (for grepping names).
+- Every game API name used was either compiled against the real 1.21.1 mappings or grepped in the decompiled sources.
+
+Layout: `dev.aero.client` with `path/` (pure A*: `PathSearch`, `Goal`, `VoxelRay`, no game classes), `pathing/` (game adapters: `LevelTerrain`, `PathExecutor`, `Miner`, `Controls`), `module/` (framework and `impl/*Modules` per category, `AutoMine`, `Navigator`, `Hud`), `mixin/`, `gui/ClickGuiScreen`, `command/Commands`, `config/Config`, `util/`.
+
+Tests, all run on this machine:
+- Pure checks (scratch, not kept in the project): path search on toy worlds (open ground, buried ore, lava, bedrock, two ores, sand, hill, cap), angle and ballistics maths, settings. They found and I fixed: a path search that dug one block too many (dug cells were not counted when checking reach), `ListSetting.reset` that restored nothing (the default shared the live set), and arrow aim that measured only tick end points.
+- `gradlew runSelftest`: starts the real client, applies all mixins, checks the registry and config.
+- `gradlew runWorldtest`: creates a flat survival world and runs AutoMine in six scenarios (open ground, inside stone, beside lava, under the ground, up a stone pillar, two ores), the navigator, behaviour checks of eleven modules and a sweep that switches every module on for 12 ticks. Last run: 129 passed, 0 failed.
+
+Not verified: other servers (their anti-cheat decides what is accepted), shader packs, most modules beyond "does not crash", other Minecraft versions. No anti-cheat evasion was written and none is planned.
+Unfinished by choice: hub integration (launch the profile from AeroHub), Xray that edits chunk rendering (Search boxes the ores instead, which works with Sodium), Tower and crystal modules.
+
+Result files: `modules/minecraft/build/libs/aeroclient-0.1.0.jar` (SHA-256 11e95906109aba16dd3af37cc01505be38119b5adf7a780ecf6abfebf8ddcf39, Java 21 class files). Mixin targets are remapped inside the classes at remapJar time (no refmap file is produced by this Loom); checked with javap: accessors, shadows and injects all carry intermediary names. The jar was NOT started in a production-style profile (the user's Modrinth profile was not touched).
+Build and test commands (Windows, from modules/minecraft, with JAVA_HOME at a JDK 21 and GRADLE_USER_HOME on a drive with space): `gradlew build`, `gradlew runSelftest`, `gradlew runWorldtest`.
+Screenshots in the READMEs (`docs/mc-world.png`, `docs/mc-menu.png`) were taken by runWorldtest itself.
+Next verifiable step: copy the jar into the Fabric 1.21.1 profile's mods folder, start it, press Right Shift, then `.mine diamond_ore` in a world with ore, and check `logs/latest.log` for `AeroClient loaded` and any `FAULT` line.
+
+## Update 19: Minecraft is launched and managed through AeroHub
+
+Request: run the Minecraft cheat through the AeroHub app instead of as a plain mod.
+Stated limit: loading the code into an already running game is not possible with this design, because the mixins only apply while the game's classes load; a rewrite as a Java agent was not attempted. So the hub does what the DLL path does for Forts, in the way Java allows: it finds the Fabric instances, installs the jar, opens the launcher and shows the mod's live status. The Play button of the Modrinth App stays with the launcher (no account handling in the hub).
+
+Done:
+- `profiles/minecraft.ini` is a new profile kind `Kind=FabricMod` (core/Profile.*: `GameKind`, `modFile`, `gameVersion`, `instanceName`, `instanceDir`). The hub expands it into one sidebar entry per instance.
+- `core/Minecraft.*`: Modrinth profile discovery (`mods` folder holding `fabric-api-*+<GameVersion>*.jar`; `ModrinthRoot`, `ModrinthExe`, `MinecraftInstances` in AeroHub.ini override), install (temp file then replace, other `aeroclient*.jar` moved to `mods\aeroclient-old`), remove, hash comparison (current / outdated), and the reader of `aeroclient-live.txt`.
+- `core/Process.*`: `FindProcessIds`, `ProcessCommandLine` (NtQueryInformationProcess class 60).
+- hub: states Not installed / Update ready / Installed / Starting / Restart needed / Active, buttons Install|Update|Open launcher, Remove mod, live card from the status file, the module log tab shows the instance's logs\latest.log.
+- mod: `LiveStatus` writes `<gameDir>\aeroclient-live.txt` once a second (pid, version, world, dimension, position, fps, modules, enabled, automine) and deletes it on exit.
+- CMake copies `modules/minecraft/build/libs/aeroclient-*.jar` to `build/out/modules/aeroclient.jar` (re-run CMake after the first jar build).
+
+Checked here: sandbox copy of the hub with a fake Modrinth root, buttons driven with posted mouse messages: the 1.21.1 profile found and the 1.20.1 one ignored, Install (stray older jar moved aside, file identical to the hub's copy), Open launcher (notepad stood in), outdated detection after editing the installed jar, Update, Remove. Live link: the hub watched a real dev client run (`runWorldtest`) and showed Active with the live rows and the game log; the status file disappears when the game closes. A read-only start against the user's real Modrinth folder listed "Minecraft · Fabric 1.21.1 / Not installed" and changed nothing.
+Not checked: Install into the user's real profile and a launch through the real Modrinth App; the running-game detection by command line against a Modrinth-launched game (the live file is the primary signal, the command line is only used before the mod has reported in).
+
+## Update 20: one Minecraft tab, two buttons (replaces the install flow of Update 19)
+
+Request: a single tab "Minecraft" with two buttons. Auto-detect (works for TLauncher and Modrinth; if nothing is found, ask the user to start Minecraft and find it through the game process) and Install mod (the jar goes to Downloads and the user drops it into the game).
+Done: the per-instance sidebar entries, installing into a profile, Remove mod and Open launcher are gone. `core/Minecraft.*` now holds: `ParseLaunchArgs` / `LooksLikeMinecraft` (pure text), `RunningGames` (java.exe / javaw.exe command lines), `InstalledGames` (extra folders from AeroHub.ini, Modrinth profiles with fabric-api for GameVersion, TLauncher gamedir from `%APPDATA%\.tlauncher\tlauncher-2.0.properties`, `.minecraft`), `HasMod`, `DownloadsFolder`, `SaveToDownloads`, `ReadLive`. The hub keeps the result in `g_mc`, remembers it in `AeroHub.ini [Minecraft]`, runs detection once at startup, and while waiting looks at the processes every second. A running game wins over anything found on disk because it is the folder the game really uses.
+Checked: `ParseLaunchArgs` and friends on Modrinth style and TLauncher style command lines (12 checks, scratch program); sandbox hub copy driven by posted mouse messages: TLauncher folder from a fake properties file, Modrinth profile for 1.21.1 (1.20.1 ignored), nothing found gives "Waiting" with the request to start Minecraft, a java process with a Modrinth style command line was picked up by the waiting hub within 1 s (launcher "Modrinth App", folder with spaces correct), Install mod put a byte-identical jar into Downloads (test copy deleted afterwards), the live card and game log on the new tab against a real dev client run.
+Known limits: the Loom dev client keeps its arguments in a config file, so its command line has no --gameDir and it cannot be found by process (use MinecraftInstances for it); a launcher that does not pass --gameDir cannot be found by process either; TLauncher and the official launcher were not available here, so only their folder logic (properties file, .minecraft) was exercised on fake folders; Modrinth App with the real profile was only listed (read-only), never launched.
+
+## Update 21: X-Ray, visible AutoMine, ore filter editor
+
+Request: add X-Ray; the user could not see how the auto-miner works and compared it with Impact (not available to me: closed source; the Baritone-style feedback was reproduced from how Baritone behaves: path line, targets, chat); then: "where is the ore filter?" (there was no filter in the GUI, only commands).
+Done:
+- `XRay` (module, `XRay.java`): hides every block that is not on its list by returning RenderShape.INVISIBLE from `BlockStateBase.getRenderShape` (`BlockStateBaseMixin`), forces all faces of listed blocks (`BlockMixin` for the vanilla mesher, `SodiumOcclusionMixin` for Sodium's `BlockOcclusionCache.shouldDrawSide`, written against Sodium 0.8.13 and @Pseudo/require=0 so a missing Sodium is harmless), turns `Minecraft.smartCull` off while on, re-meshes with `levelRenderer.allChanged()`, optional Fullbright. Block entities with their own renderers (chests, signs, banners) stay visible.
+- AutoMine: path line, to-dig boxes and target box in the world, a status panel, chat messages (found / path / mining / mined / nothing / no path), range 64 (max 128), far targets are walked in parts (`walkPartial`, 60 replans, 200000 expansions). `PathSearch`: heuristic now counts height too, and the search sees cells dug on its last 8 steps (a staircase could step onto a cell it had dug); `PathSearch.cost()`; `PathExecutor` exposes steps/index/cost/digsLeft.
+- `ListEditorScreen` (registry list with icons, search, check marks, All ores / Clear / Done) opens from the `edit` button of any block/item list row in the click GUI; `ListSetting.Kind` (BLOCK / ITEM / TEXT; text lists stay on `.set`).
+- Build: Loom 1.16.1 (Sodium 0.8.13 is built with 1.16.1 and Loom 1.15.5 refused to remap it for the dev client). `-PsodiumJar=<path>` adds Sodium to the dev client for `runWorldtest`.
+Checked: path program 33 checks incl. 30 blocks up/down inside stone; `runSelftest` passed (116 registered, 114 visible); `runWorldtest` 140 passed / 0 failed on the vanilla renderer and again with the user's Sodium 0.8.13 loaded (X-Ray screenshots on both show the stone and ground gone and only ores, spawner and chest left; the "off" shot on Sodium shows the solid wall); new scenarios: 22 blocks up through stone, an ore 90 blocks away, the filter editor toggling an entry by click.
+Not checked: Iris shader packs with X-Ray, Sodium versions other than 0.8.13, the installed jar in the user's real profile, a real key press for the menu keys.
+
+## Update 22: X-Ray night vision, tool choice, whole veins, walking without loops
+
+Requests: (a) X-Ray turns on Fullbright, but only turns it off again if X-Ray was the one that turned it on; (b) AutoMine picks the pickaxe itself, stops when none is good enough (wooden pickaxe vs diamond ore) or none exists, and may take it from the main inventory; (c) AutoMine must mine the whole vein, and it walked in circles on a straight road.
+Done:
+- `XRay`: `addedFullbright`; if the user switches Fullbright off by hand meanwhile, X-Ray forgets it owns it.
+- `Miner.evaluate(state, pos, slots)` puts each candidate stack in the selected slot for a moment and asks the game for `getDestroyProgress`; ranks "block drops its item" first, then speed, ties to the selected slot. `Miner.canHarvest`, `Miner.mine(pos, fromInventory)` swaps a main-inventory tool into the hand (`InventoryUtil.swapWithHotbar`, only with no screen open). `LevelTerrain` and `PathExecutor` take `toolsFromInventory` (setting "Tools from inventory", default on). `AutoMine.scanTick` drops ores no tool can harvest and stops with a reason when none is left; `mineTick` re-checks before each block.
+- Vein: after each ore `AutoMine` runs a breadth-first search over the scanned ores (26 neighbours) from the mined ones and hands only those to the path goal until the vein is finished; drops are collected afterwards.
+- Walking: the cause was sprint overshoot. The player passed a cell, the step was only counted when he stood exactly on it, so he turned back. Now the furthest of the next 3 path cells he stands on counts (no skipping across steps that still have blocks to dig), and sprint is allowed only on a straight run of flat, dig-free steps.
+Checked here: `gradlew build` exit 0; `runSelftest` PASSED; `runWorldtest` 162 passed / 0 failed. New scenarios: night vision (8 phases), wooden pickaxe stops, no pickaxe stops, pickaxe only in the main inventory, 50-block flat road, 50-block bumpy road, 5-ore diagonal vein with a nearer decoy ore. The bumpy road reproduces the loop with the old code (75 blocks walked for a 50-block road) and passes with the fix (269 ticks); the flat road did not reproduce it with the old code.
+Not verified: the circling in the user's real world (cause matched on a synthetic road only); tool durability is ignored (a nearly broken pickaxe can be chosen); a tool breaking mid-vein is handled by the pre-block check but has no test; X-Ray with Iris and other Sodium versions; servers that strip the night vision effect; Nuker and AutoLumber still use the hotbar only; the new jar was not run in the user's real profile.
+Next verifiable step: put `build/out/modules/aeroclient.jar` into the profile, mine a diamond vein with an iron pickaxe, then a road over hills; if it loops again, take `logs/latest.log` and the terrain description.

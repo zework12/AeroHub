@@ -1,0 +1,33 @@
+{
+	"required": true,
+	"package": "dev.aero.client.mixin",
+	"compatibilityLevel": "JAVA_21",
+	"client": [
+		"BlockMixin",
+		"BlockStateBaseMixin",
+		"CameraMixin",
+		"ChatComponentMixin",
+		"ClientPacketListenerMixin",
+		"ConnectionMixin",
+		"EntityAccessor",
+		"EntityMixin",
+		"GameRendererMixin",
+		"GuiMixin",
+		"KeyMappingAccessor",
+		"KeyboardInputMixin",
+		"LevelMixin",
+		"LivingEntityAccessor",
+		"LivingEntityMixin",
+		"LivingEntityRendererMixin",
+		"LocalPlayerMixin",
+		"MinecraftAccessor",
+		"MinecraftMixin",
+		"MultiPlayerGameModeAccessor",
+		"PlayerMixin",
+		"ScreenEffectRendererMixin",
+		"SodiumOcclusionMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

@@ -1,5 +1,6 @@
 #include "Process.hpp"
 
+#include <winternl.h>
 #include <tlhelp32.h>
 
 #include <cwchar>
@@ -34,6 +35,35 @@ std::optional<DWORD> FindProcessId(std::wstring_view exeName) {
         if (EqualNoCase(exeName, pe.szExeFile)) return pe.th32ProcessID;
     }
     return std::nullopt;
+}
+
+std::vector<DWORD> FindProcessIds(std::wstring_view exeName) {
+    std::vector<DWORD> out;
+    UniqueHandle snap = Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (!snap) return out;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+    for (BOOL ok = Process32FirstW(snap.get(), &pe); ok; ok = Process32NextW(snap.get(), &pe)) {
+        if (EqualNoCase(exeName, pe.szExeFile)) out.push_back(pe.th32ProcessID);
+    }
+    return out;
+}
+
+std::wstring ProcessCommandLine(DWORD pid) {
+    // NtQueryInformationProcess(ProcessCommandLineInformation = 60), available from Windows 8.1.
+    using NtQuery = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static const NtQuery query = reinterpret_cast<NtQuery>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    if (!query) return {};
+    UniqueHandle proc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+    if (!proc) return {};
+    ULONG need = 0;
+    query(proc.get(), 60, nullptr, 0, &need);
+    if (need < sizeof(UNICODE_STRING) || need > (1u << 20)) return {};
+    std::vector<unsigned char> buf(need + 16);
+    if (query(proc.get(), 60, buf.data(), static_cast<ULONG>(buf.size()), &need) < 0) return {};
+    const auto* us = reinterpret_cast<const UNICODE_STRING*>(buf.data());
+    if (!us->Buffer || us->Length == 0) return {};
+    return std::wstring(us->Buffer, us->Length / sizeof(wchar_t));
 }
 
 std::optional<std::uintptr_t> FindModuleBase(DWORD pid, std::wstring_view moduleName) {

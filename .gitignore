@@ -2,3 +2,5 @@ build/
 *.running-old.*
 *.log
 *.dmp
+.gradle/
+run/
