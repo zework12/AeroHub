@@ -99,6 +99,7 @@ int g_sel = 0;
 bool g_autoInject = false;
 int g_tab = 0;  // 0 module log, 1 hub log
 bool g_demo = false;
+bool g_demoVulkan = false;  // --demo-vulkan: the demo also shows the "Forts is on Vulkan" warning
 
 aero::ipc::Client g_client;
 DWORD g_clientPid = 0;
@@ -486,8 +487,8 @@ bool IsForts(const aero::GameProfile& p) {
 void UpdateGraphics() {
     const int sel = SelectedProfile();
     if (sel < 0 || !IsForts(g_profiles[sel])) return;
-    if (g_demo) {  // preview of the warning; the actions are disabled in demo mode
-        g_gfx.state = aero::diag::GraphicsState::Vulkan;
+    if (g_demo) {  // fake data; the actions are disabled in demo mode
+        g_gfx.state = g_demoVulkan ? aero::diag::GraphicsState::Vulkan : aero::diag::GraphicsState::OpenGl;
         g_gfx.file = L"<demo>\\settings_hardware.lua";
         return;
     }
@@ -1180,6 +1181,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     g_demo = cmdLine && std::wstring(cmdLine).find(L"--demo") != std::wstring::npos;  // preview with fake data
+    g_demoVulkan = cmdLine && std::wstring(cmdLine).find(L"--demo-vulkan") != std::wstring::npos;
 
     wchar_t exe[MAX_PATH]{};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
