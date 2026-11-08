@@ -13,6 +13,7 @@
 
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlobj.h>
 #include <uxtheme.h>
 
 #include <cstdio>
@@ -22,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "Diagnostics.hpp"
 #include "Inject.hpp"
 #include "Ipc.hpp"
 #include "Minecraft.hpp"
@@ -65,7 +67,7 @@ struct Link {
     Level level = Level::Idle;
 };
 
-enum class Act { None, SelectGame, Primary, Secondary, Refresh, AutoSwitch, TabModule, TabHub };
+enum class Act { None, SelectGame, Primary, Secondary, Refresh, AutoSwitch, TabModule, TabHub, CollectLogs, SwitchOpenGl };
 struct Hit {
     RectF r;
     Act act = Act::None;
@@ -104,6 +106,11 @@ LONG g_lastBeat = -1;
 int g_staleTicks = 0;
 std::vector<InfoRow> g_infoRows;
 Link g_link;
+
+// Forts reads settings_hardware.lua at start; the module only works when EnableVulkan is false (OpenGL).
+std::optional<std::filesystem::path> g_fortsDir;
+ULONGLONG g_fortsDirTried = 0;  // GetTickCount64 of the last folder search; the search is repeated every 10 s while nothing is found
+aero::diag::GraphicsInfo g_gfx;
 
 int g_tailProfile = -1;
 std::filesystem::path g_tailPath;
@@ -471,9 +478,87 @@ void SaveMod() {
     ShellExecuteW(g_hwnd, L"open", L"explorer.exe", (L"/select,\"" + saved.wstring() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
 }
 
+// ---------------------------------------------------------------- Forts: graphics setting and log bundle
+bool IsForts(const aero::GameProfile& p) {
+    return p.kind == aero::GameKind::NativeModule && _wcsicmp(p.processName.c_str(), L"Forts.exe") == 0;
+}
+
+void UpdateGraphics() {
+    const int sel = SelectedProfile();
+    if (sel < 0 || !IsForts(g_profiles[sel])) return;
+    if (g_demo) {  // preview of the warning; the actions are disabled in demo mode
+        g_gfx.state = aero::diag::GraphicsState::Vulkan;
+        g_gfx.file = L"<demo>\\settings_hardware.lua";
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    if (!g_fortsDir && now - g_fortsDirTried > 10000) {
+        g_fortsDirTried = now;
+        g_fortsDir = aero::diag::FindFortsDir();
+    }
+    if (g_fortsDir) g_gfx = aero::diag::CheckFortsGraphics(*g_fortsDir);
+}
+
+void DoSwitchOpenGl() {
+    if (g_demo) {
+        Log(L"demo: the settings file is not changed");
+        return;
+    }
+    if (g_gfx.file.empty()) return;
+    const bool vulkan = g_gfx.state == aero::diag::GraphicsState::Vulkan;
+    const std::wstring text =
+        (vulkan ? L"Forts is set to Vulkan, and the AeroHub module only works with OpenGL.\n\nSet EnableVulkan = false in\n"
+                : L"The Forts settings file has no EnableVulkan entry, so the game picks the graphics API itself. The AeroHub module only works with OpenGL.\n\nAdd EnableVulkan = false to\n") +
+        g_gfx.file.wstring() +
+        L"\n\nA backup copy (settings_hardware.lua.aerohub-bak) is kept next to it. Forts must be closed; the change applies the next time the game starts.";
+    if (MessageBoxW(g_hwnd, text.c_str(), L"Switch to OpenGL", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    const std::wstring err = aero::diag::SwitchToOpenGl(g_gfx.file);
+    if (!err.empty()) {
+        Log(L"Switch to OpenGL failed: " + err);
+        MessageBoxW(g_hwnd, err.c_str(), L"Switch to OpenGL", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    Log(L"Forts is now set to OpenGL (EnableVulkan = false). Backup: " + g_gfx.file.wstring() + L".aerohub-bak. Start the game to apply it.");
+    UpdateGraphics();
+}
+
+void DoCollectLogs() {
+    const int sel = SelectedProfile();
+    if (sel < 0 || !IsForts(g_profiles[sel])) return;
+    if (g_demo) {
+        Log(L"demo: logs are not collected");
+        return;
+    }
+    const int answer = MessageBoxW(
+        g_hwnd,
+        L"AeroHub will pack the Forts game log, the newest desync reports, the AeroHub module log and a short summary into one zip file on your Desktop.\n\n"
+        L"The files contain your Windows user name (in file paths) and your Steam name and ID. Nothing is uploaded: you send the zip yourself.\n\nCreate the zip?",
+        L"Collect logs", MB_YESNO | MB_ICONQUESTION);
+    if (answer != IDYES) return;
+    std::filesystem::path outDir = g_dir;
+    PWSTR desktop = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &desktop))) outDir = desktop;
+    CoTaskMemFree(desktop);
+    std::filesystem::path moduleLog = g_dir / g_profiles[sel].moduleDll;
+    moduleLog.replace_extension(L".log");
+    wchar_t exe[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    const HCURSOR previous = SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+    const auto r = aero::diag::CollectFortsLogs(exe, moduleLog, outDir);
+    SetCursor(previous);
+    if (!r.error.empty()) {
+        Log(L"Collect logs failed: " + r.error);
+        MessageBoxW(g_hwnd, (L"Could not create the zip:\n" + r.error).c_str(), L"Collect logs", MB_OK | MB_ICONERROR);
+        return;
+    }
+    Log(L"Logs packed into " + r.zip.wstring() + L" (" + std::to_wstring(r.files.size()) + L" files). Send this file.");
+    ShellExecuteW(g_hwnd, L"open", L"explorer.exe", (L"/select,\"" + r.zip.wstring() + L"\"").c_str(), nullptr, SW_SHOWNORMAL);
+}
+
 void Refresh() {
     g_status.clear();
     for (const auto& p : g_profiles) g_status.push_back(Evaluate(p));
+    UpdateGraphics();
     if (g_demo && !g_status.empty()) {
         g_status[0].level = Level::Active;
         g_status[0].text = L"Build matches the profile (demo). Module loaded.";
@@ -772,6 +857,12 @@ void DrawHeader(Gdiplus::Graphics& g, const Lay& L) {
         AddHit(Act::Primary, 0, primary, prim.enabled);
         AddHit(Act::Refresh, 0, refresh);
         leftmost = primary.X;
+        if (IsForts(g_profiles[sel])) {
+            const RectF logs(primary.X - S(12) - S(150), h.Y + S(2), S(150), bh);
+            DrawButton(g, logs, L"Collect logs", false, true, IsHover(Act::CollectLogs, 0), IsPressed(Act::CollectLogs, 0));
+            AddHit(Act::CollectLogs, 0, logs);
+            leftmost = logs.X;
+        }
     }
 
     // Status pill and details under the title.
@@ -792,7 +883,22 @@ void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
                                                        : L"Press Auto-detect Minecraft. If it finds nothing, start the game.")
                               : active   ? L"Cheats are switched in the game itself. Open its menu during a match."
                                          : L"Launch the game and load the module; cheats are then switched in the game's own menu.";
-    DrawStr(g, lead, *g_fBody, RectF(c.X + S(20), c.Y + S(50), c.Width - S(40), S(24)), kText);
+    // The module hooks OpenGL's SwapBuffers, so a Forts set to Vulkan never shows the menu: say so and offer the fix.
+    float shift = 0;
+    if (sel >= 0 && IsForts(g_profiles[sel]) &&
+        (g_gfx.state == aero::diag::GraphicsState::Vulkan || g_gfx.state == aero::diag::GraphicsState::NotSet)) {
+        shift = S(58);
+        const RectF strip(c.X + S(20), c.Y + S(46), c.Width - S(40), S(48));
+        FillRR(g, strip, S(8), kWarn, 34);
+        StrokeRR(g, strip, S(8), kWarn, 1.0f, 150);
+        const RectF btn(strip.X + strip.Width - S(160) - S(6), strip.Y + S(6), S(160), strip.Height - S(12));
+        const bool vulkan = g_gfx.state == aero::diag::GraphicsState::Vulkan;
+        DrawStr(g, vulkan ? L"Forts is on Vulkan: needs OpenGL" : L"Graphics API not set: needs OpenGL", *g_fSmall,
+                RectF(strip.X + S(14), strip.Y, strip.Width - btn.Width - S(30), strip.Height), kText);
+        DrawButton(g, btn, L"Switch to OpenGL", true, true, IsHover(Act::SwitchOpenGl, 0), IsPressed(Act::SwitchOpenGl, 0));
+        AddHit(Act::SwitchOpenGl, 0, btn);
+    }
+    DrawStr(g, lead, *g_fBody, RectF(c.X + S(20), c.Y + S(50) + shift, c.Width - S(40), S(24)), kText);
 
     if (sel < 0) return;
     // One line per "|"-separated hint. The Minecraft tab starts with what it knows about the game and the mod file.
@@ -805,7 +911,7 @@ void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
         hk = info + (hk.empty() ? L"" : L"  |  " + hk);
     }
     if (hk.empty()) return;
-    float y = c.Y + S(92);
+    float y = c.Y + S(92) + shift;
     const float lh = S(34);
     Gdiplus::Pen sep(Col(kBorder), 1.0f);
     for (std::size_t start = 0; start <= hk.size();) {
@@ -925,6 +1031,8 @@ void Perform(Act act, int idx) {
         case Act::AutoSwitch: g_autoInject = !g_autoInject; SaveSettings(); break;
         case Act::TabModule: g_tab = 0; PositionLogs(); break;
         case Act::TabHub: g_tab = 1; PositionLogs(); break;
+        case Act::CollectLogs: DoCollectLogs(); break;
+        case Act::SwitchOpenGl: DoSwitchOpenGl(); break;
         case Act::None: break;
     }
     Redraw();

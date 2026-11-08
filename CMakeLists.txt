@@ -20,6 +20,7 @@ add_library(AeroCore STATIC
   core/Inject.cpp
   core/Profile.cpp
   core/Minecraft.cpp
+  core/Diagnostics.cpp
   core/IatHook.cpp
   core/Ipc.cpp)
 target_include_directories(AeroCore PUBLIC core)
