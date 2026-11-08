@@ -23,26 +23,30 @@ inline int PredictTrajectory(Vec2f p0, Vec2f v0, float gravityY, float drag, flo
         !std::isfinite(gravityY) || !std::isfinite(drag) || drag < 0.0f)
         return 0;
 
+    // Numerically stable form of the closed solution (double precision). With A(t) = (1 - e^(-k t)) / k and
+    // B(t) = (t - A) / k:  x = x0 + vx0 A,  y = y0 + vy0 A + g B,  vy = vy0 e^(-k t) + g A.
+    // For small k t the quotients lose all digits (k = 0.0001 made the old float form jump by thousands of units),
+    // so a Taylor series is used there; k = 0 falls out of it exactly (A = t, B = t^2 / 2).
     const float gDir = gravityY >= 0.0f ? 1.0f : -1.0f;
-    const bool noDrag = drag < 1.0e-5f;
-    const float vt = noDrag ? 0.0f : gravityY / drag;  // terminal vertical velocity
+    const double g = gravityY, k = drag;
     int n = 0;
     for (; n < cap; ++n) {
-        const float t = static_cast<float>(n) * dt;
-        if (t > maxTime) break;
-        Vec2f p;
-        float vy;
-        if (noDrag) {
-            p = {p0.x + v0.x * t, p0.y + v0.y * t + 0.5f * gravityY * t * t};
-            vy = v0.y + gravityY * t;
+        const double t = static_cast<double>(n) * static_cast<double>(dt);
+        if (t > static_cast<double>(maxTime)) break;
+        const double x = k * t;
+        double a, b;
+        if (x < 1.0e-3) {
+            a = t * (1.0 - x / 2.0 + x * x / 6.0 - x * x * x / 24.0 + x * x * x * x / 120.0);
+            b = t * t * (0.5 - x / 6.0 + x * x / 24.0 - x * x * x / 120.0);
         } else {
-            const float e = std::exp(-drag * t);
-            const float k = (1.0f - e) / drag;
-            p = {p0.x + v0.x * k, p0.y + vt * t + (v0.y - vt) * k};
-            vy = vt + (v0.y - vt) * e;
+            a = -std::expm1(-x) / k;
+            b = (t - a) / k;
         }
+        const Vec2f p{static_cast<float>(p0.x + v0.x * a), static_cast<float>(p0.y + v0.y * a + g * b)};
+        const double vy = v0.y * std::exp(-x) + g * a;
+        if (!std::isfinite(p.x) || !std::isfinite(p.y)) break;
         out[n] = p;
-        const bool pastApex = vy * gDir > 0.0f;
+        const bool pastApex = vy * gDir > 0.0;
         if (pastApex && (p.y - p0.y) * gDir > dropLimit) {
             ++n;
             break;
