@@ -38,6 +38,7 @@ struct PanelLine {
     std::wstring key, value;
     COLORREF color = 0;  // value colour; 0 = default text colour
 };
-void RenderPanel(const std::wstring& title, const std::vector<PanelLine>& lines, float scale, HudImage& out);
+// `width` is in unscaled pixels (the key column stays 130 wide, the value column takes the rest).
+void RenderPanel(const std::wstring& title, const std::vector<PanelLine>& lines, float scale, HudImage& out, float width = 300.0f);
 
 }  // namespace forts

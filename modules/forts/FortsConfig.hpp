@@ -80,6 +80,34 @@ inline constexpr int kMaxTeamCode = 9999;
 inline constexpr ApiFn kSendScriptEvent{"SendScriptEvent", 0xC6F60, {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57}};
 inline constexpr ApiFn kUpdateWeaponAim{"UpdateWeaponAim", 0xE5330, {0x40, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0x05, 0xF3, 0x7E, 0x83, 0x00, 0x45, 0x33, 0xC0}};
 
+// Terrain, water and weapon-timer queries. Addresses: the game's own Lua registration table (every `lea r8,[handler]` /
+// `lea rdx,[name]` pair in .text of Forts.exe on disk, buildid 26181732); signatures: read from the handlers' disassembly.
+//   GetWaterLevel(float x) -> float      piecewise-constant table at world + 0x12E8..0x12F0 (12-byte entries: x threshold, level, ...);
+//                                        about 2.1e9 on maps without water. Deeper is a LARGER y: GetWaterDepthAt(pos) = pos.y - level.
+//   CastGroundRay(const Vec3* a, const Vec3* b, int flags) -> 1 when the segment touches terrain (water is not terrain);
+//                                        GetRayHitPosition(Vec3* out) returns the point stored by the last cast.
+//   IsWeaponReadyToFire(int deviceId) -> bool;  GetWeaponReloadTime(int id) -> float = reload period * a fraction kept at
+//                                        weapon + 0x4B8 (whether that fraction is the remaining or the elapsed part is NOT confirmed:
+//                                        the module learns it from the first reload it sees to completion);
+//                                        GetWeaponReloadPeriodById(int id) -> float seconds. None of them checks the device's team.
+inline constexpr ApiFn kGetWaterLevel{"GetWaterLevel", 0xE05B0, {0x48, 0x8B, 0x05, 0x79, 0xCC, 0x83, 0x00, 0x48, 0x8B, 0x80, 0xE0, 0x1C, 0x00, 0x00, 0x48, 0x8B}};
+inline constexpr ApiFn kCastGroundRay{"CastGroundRay", 0xD9570, {0x40, 0x53, 0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00, 0xF3, 0x0F, 0x10, 0x01, 0x33, 0xDB, 0xF3}};
+inline constexpr ApiFn kGetRayHitPosition{"GetRayHitPosition", 0xD9E60, {0xF3, 0x0F, 0x10, 0x05, 0xE0, 0x33, 0x84, 0x00, 0x48, 0x8B, 0xC1, 0xF3, 0x0F, 0x10, 0x0D, 0xD9}};
+inline constexpr ApiFn kIsWeaponReadyToFire{"IsWeaponReadyToFire", 0xD7610, {0x48, 0x83, 0xEC, 0x38, 0x48, 0x8B, 0x05, 0x15, 0x5C, 0x84, 0x00, 0x44, 0x8B, 0xC9, 0x4C, 0x8B}};
+inline constexpr ApiFn kGetWeaponReloadTime{"GetWeaponReloadTime", 0xE41B0, {0x40, 0x53, 0x48, 0x83, 0xEC, 0x30, 0x48, 0x8B, 0x05, 0x73, 0x90, 0x83, 0x00, 0x33, 0xD2, 0x4C}};
+inline constexpr ApiFn kGetWeaponReloadPeriodById{"GetWeaponReloadPeriodById", 0xE3F30, {0x48, 0x83, 0xEC, 0x38, 0x48, 0x8B, 0x05, 0xF5, 0x92, 0x83, 0x00, 0x33, 0xD2, 0x4C, 0x8B, 0x90}};
+// GetLocalSelectedDeviceId (0xCF710): int(), no arguments; the device the local player has selected (-1 / 0 when none).
+// Which of the player's actions "selects" a gun this way is not confirmed in game.
+inline constexpr ApiFn kGetLocalSelectedDeviceId{"GetLocalSelectedDeviceId", 0xCF710, {0x4C, 0x8B, 0x0D, 0x19, 0xDB, 0x84, 0x00, 0x49, 0x8B, 0x81, 0xD0, 0x1C, 0x00, 0x00, 0x4C, 0x8B}};
+// GetMousePos (0xE6700): Vec3*(Vec3* out), the mouse in the game's screen space. ScreenToWorld (0xE68B0): Vec3*(Vec3* out, const Vec3* screen),
+// forwards to the camera object's virtual converter. That the mouse position and the converter use the same screen space is not confirmed
+// in game; the self-test logs a WorldToScreen -> ScreenToWorld round trip for that.
+inline constexpr ApiFn kGetMousePos{"GetMousePos", 0xE6700, {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0xD9, 0x48, 0x8B, 0xD1, 0x48, 0x8B, 0x0D, 0xAD}};
+inline constexpr ApiFn kScreenToWorld{"ScreenToWorld", 0xE68B0, {0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x8B, 0x05, 0x73, 0x69, 0x83, 0x00, 0x48, 0x8B, 0xD9}};
+// Node field read by GetNodeGroundBlockIndex (0xE2690): the terrain block a node is anchored to; -1 expected for a free node
+// (the -1 is the handler's value for an unknown node id; for a known free node it is an assumption).
+inline constexpr std::ptrdiff_t kNodeGroundBlock = 0x18;
+
 // Raw device list of the simulation object: vector of device pointers at kGameSimOff + kDeviceListBegin/End, each
 // device with its id, team code (compared by every Lua handler) and state byte (5 = ignored by them).
 inline constexpr std::ptrdiff_t kDeviceListBegin = 0x6C0, kDeviceListEnd = 0x6C8;
@@ -121,9 +149,16 @@ inline constexpr float kFastBuildValue = 0.1f;
 inline constexpr std::uintptr_t kAimAngleRva = 0x91C3B4;
 inline constexpr std::uintptr_t kAimSpeedRva = 0x91C4AC;
 
-// Air drag fallback (per second) for a weapon type that has not been measured yet. Measured from recorded shots:
-// cannon 0.016, machinegun 0.07, howitzer-class shell 0.06. The module learns each type from live shots.
-inline constexpr float kDefaultDrag = 0.016f;
+// Projectile physics, measured on 501 recorded shots (4998 observed positions agree with the model to the log's rounding, 0.07 rms):
+// the simulation runs in frames of 0.04 s (Physics.FramesRate = 25); each frame v += (g - k v) * h, then p += v * h (see Tactics.hpp).
+// The drag is LINEAR in the velocity. Two values occurred: k = 0 (cannon, 252 shots) and k = 0.0840 (machinegun, ProjectileDrag 0.021,
+// 227 shots), i.e. k = kDragFactor * ProjectileDrag (= Physics.AirDrag 0.4 * 10). The factor rests on that one type; the module also
+// measures k on live shots (exactly, EstimateDragFrames) and trusts the measurement over the formula. GetProjectileTypeDrag (0xD43A0) has
+// the same shape as GetProjectileTypeGravity: (const char* projectileName, int team) -> float. Shells with a ProjectileDrag of at least
+// kPropelledDrag (missile: 64) fly under thrust and are not predicted.
+inline constexpr float kDragFactor = 4.0f;
+inline constexpr float kPropelledDrag = 2.0f;
+inline constexpr ApiFn kGetProjectileTypeDrag{"GetProjectileTypeDrag", 0xD43A0, {0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57}};
 
 // Physics.Gravity from data/db/constants.lua (measured from the game's data file). The direction of
 // "down" in world space is an assumption (+Y, i.e. Y grows downward); FortsModule.ini can override it.

@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <unordered_map>
 
 #include "FortsConfig.hpp"
 #include "Log.hpp"
@@ -24,6 +25,7 @@ using FnGetWeaponCount = int (*)(int);
 using FnGetWeaponId = int (*)(int, int);
 using FnVec3ById = Vec3* (*)(Vec3*, int);
 using FnWorldToScreen = Vec3* (*)(Vec3*, const Vec3*);
+using FnVec3Out = Vec3* (*)(Vec3*);
 using FnProjectileCount = int (*)(int);
 using FnGetProjectileId = int (*)(int, int);
 using FnGetProjectileGravity = float (*)(int);
@@ -41,6 +43,11 @@ using FnGetDeviceHp = float (*)(int);
 using FnRepairDevice = void (*)(int);
 using FnUpdateWeaponAim = void (*)(int, const Vec3*);
 using FnSendScriptEvent = void (*)(const char*, const char*, const char*, bool);
+using FnWaterLevel = float (*)(float);
+using FnCastGroundRay = int (*)(const Vec3*, const Vec3*, int);
+using FnRayHitPosition = Vec3* (*)(Vec3*);
+using FnWeaponReady = unsigned char (*)(int);
+using FnWeaponSeconds = float (*)(int);
 
 // Material record names: either an inline char array or an MSVC std::string at the same address.
 std::string ReadRecordName(const std::uint8_t* p) {
@@ -145,7 +152,10 @@ bool GameApi::Init(HMODULE exe, std::string& error) {
                                 &cfg::kGetTeamCommanderPoints, &cfg::kAddTeamCommanderPoints, &cfg::kSetOverrideBuildTime,
                                 &cfg::kIsCommanderActive, &cfg::kSetOverrideReloadTime, &cfg::kGetDeviceCount, &cfg::kGetDeviceId,
                                 &cfg::kGetDevicePosition, &cfg::kGetDeviceHitpoints, &cfg::kGetDeviceInitialHitpoints,
-                                &cfg::kRepairDevice, &cfg::kUpdateWeaponAim, &cfg::kSendScriptEvent}) {
+                                &cfg::kRepairDevice, &cfg::kUpdateWeaponAim, &cfg::kSendScriptEvent,
+                                &cfg::kGetWaterLevel, &cfg::kCastGroundRay, &cfg::kGetRayHitPosition, &cfg::kIsWeaponReadyToFire,
+                                &cfg::kGetWeaponReloadTime, &cfg::kGetWeaponReloadPeriodById, &cfg::kGetProjectileTypeDrag,
+                                &cfg::kGetLocalSelectedDeviceId, &cfg::kGetMousePos, &cfg::kScreenToWorld}) {
         if (!CheckFunction(*f, error)) return false;
     }
     return true;
@@ -630,6 +640,139 @@ bool GameApi::AimInput(float& angle, float& speed) const {
         angle = *reinterpret_cast<const float*>(g_base + cfg::kAimAngleRva);
         speed = *reinterpret_cast<const float*>(g_base + cfg::kAimSpeedRva);
         return std::isfinite(angle) && std::isfinite(speed);
+    });
+}
+
+bool GameApi::ProjectileTypeDrag(const std::string& projectileName, int team, float& drag) const {
+    return Guard([&] {
+        drag = Fn<FnProjectileTypeGravity>(cfg::kGetProjectileTypeDrag)(projectileName.c_str(), team);  // same (name, team) -> float shape
+        return std::isfinite(drag) && drag >= 0.0f && drag < 1.0e4f;
+    });
+}
+
+bool GameApi::GroundRay(const Vec3& a, const Vec3& b, bool& hit, Vec3& point) const {
+    return Guard([&] {
+        hit = Fn<FnCastGroundRay>(cfg::kCastGroundRay)(&a, &b, 0) != 0;  // flags 0 = TERRAIN_NOFLAG as the game's own mods pass it
+        if (!hit) return true;
+        Fn<FnRayHitPosition>(cfg::kGetRayHitPosition)(&point);
+        return Plausible(point);
+    });
+}
+
+bool GameApi::WaterLevelAt(float x, float& level) const {
+    return Guard([&] {
+        level = Fn<FnWaterLevel>(cfg::kGetWaterLevel)(x);
+        return std::isfinite(level);
+    });
+}
+
+bool GameApi::SelectedDevice(int& deviceId) const {
+    return Guard([&] {
+        deviceId = Fn<FnGetLocalTeamId>(cfg::kGetLocalSelectedDeviceId)();
+        return true;
+    });
+}
+
+bool GameApi::MouseWorld(Vec3& screen, Vec3& world) const {
+    return Guard([&] {
+        Fn<FnVec3Out>(cfg::kGetMousePos)(&screen);
+        Fn<FnWorldToScreen>(cfg::kScreenToWorld)(&world, &screen);
+        return Plausible(screen) && Plausible(world);
+    });
+}
+
+bool GameApi::ScreenToWorldPoint(const Vec3& screen, Vec3& world) const {
+    return Guard([&] {
+        Fn<FnWorldToScreen>(cfg::kScreenToWorld)(&world, &screen);
+        return Plausible(world);
+    });
+}
+
+bool GameApi::WeaponReady(int deviceId, bool& ready) const {
+    return Guard([&] {
+        ready = Fn<FnWeaponReady>(cfg::kIsWeaponReadyToFire)(deviceId) != 0;
+        return true;
+    });
+}
+
+bool GameApi::WeaponReload(int deviceId, float& value, float& period) const {
+    return Guard([&] {
+        value = Fn<FnWeaponSeconds>(cfg::kGetWeaponReloadTime)(deviceId);
+        period = Fn<FnWeaponSeconds>(cfg::kGetWeaponReloadPeriodById)(deviceId);
+        return std::isfinite(value) && std::isfinite(period) && period >= 0.0f && period < 1.0e4f && std::fabs(value) < 1.0e5f;
+    });
+}
+
+bool GameApi::BaseGraphOf(int teamCode, BaseGraph& out) const {
+    out.nodes.clear();
+    out.edges.clear();
+    return Guard([&] {
+        const std::uint8_t* g = Game();
+        if (!g) return false;
+        const std::uint8_t* world = *reinterpret_cast<const std::uint8_t* const*>(g + cfg::kGameWorldOff);
+        if (!world) return false;
+        std::uint8_t* const* begin = *reinterpret_cast<std::uint8_t* const* const*>(world + cfg::kNodeListBegin);
+        std::uint8_t* const* end = *reinterpret_cast<std::uint8_t* const* const*>(world + cfg::kNodeListEnd);
+        if (!begin || end < begin || static_cast<std::size_t>(end - begin) > 20000) return false;
+        const int side = std::clamp(((teamCode % 100) + 100) % 100 - 1, 0, cfg::kMaterialSides - 1);
+        auto position = [](const std::uint8_t* n, float& x, float& y) {
+            const std::ptrdiff_t off = n[cfg::kNodeMovingFlag] ? cfg::kNodePosMoving : cfg::kNodePosStatic;
+            std::memcpy(&x, n + off, sizeof(x));
+            std::memcpy(&y, n + off + 4, sizeof(y));
+            return std::isfinite(x) && std::isfinite(y) && std::fabs(x) < 1.0e7f && std::fabs(y) < 1.0e7f;
+        };
+        // Pass 1: the live nodes of this team.
+        std::vector<const std::uint8_t*> ptrs;
+        for (std::uint8_t* const* it = begin; it != end && ptrs.size() < 6000; ++it) {
+            const std::uint8_t* node = *it;
+            if (!node || node[cfg::kNodeDead] != 0) continue;
+            int team = 0;
+            std::memcpy(&team, node + cfg::kNodeTeam, sizeof(team));
+            if (team != teamCode) continue;
+            GraphNode n;
+            if (!position(node, n.x, n.y)) continue;
+            std::memcpy(&n.id, node + cfg::kNodeId, sizeof(n.id));
+            int ground = -1;
+            std::memcpy(&ground, node + cfg::kNodeGroundBlock, sizeof(ground));
+            n.ground = ground;
+            n.anchored = ground >= 0 && ground < 100000;
+            out.nodes.push_back(n);
+            ptrs.push_back(node);
+        }
+        if (out.nodes.empty()) return false;
+        std::unordered_map<int, int> index;
+        for (std::size_t i = 0; i < out.nodes.size(); ++i) index[out.nodes[i].id] = static_cast<int>(i);
+        // Pass 2: every link once (it sits in both of its nodes; take it from the node with the smaller id).
+        for (std::size_t i = 0; i < ptrs.size() && out.edges.size() < 12000; ++i) {
+            const std::uint8_t* node = ptrs[i];
+            const std::uint8_t* lbegin = *reinterpret_cast<const std::uint8_t* const*>(node + cfg::kNodeLinksBegin);
+            const std::uint8_t* lend = *reinterpret_cast<const std::uint8_t* const*>(node + cfg::kNodeLinksEnd);
+            if (!lbegin || lend <= lbegin || static_cast<std::size_t>(lend - lbegin) % cfg::kLinkRecord != 0) continue;
+            const std::size_t count = static_cast<std::size_t>(lend - lbegin) / cfg::kLinkRecord;
+            if (count > 64) continue;
+            for (std::size_t j = 0; j < count; ++j) {
+                const std::uint8_t* rec = lbegin + j * cfg::kLinkRecord;
+                const std::uint8_t* other = *reinterpret_cast<const std::uint8_t* const*>(rec + cfg::kLinkOtherNode);
+                if (!other) continue;
+                int otherId = 0;
+                std::memcpy(&otherId, other + cfg::kNodeId, sizeof(otherId));
+                if (otherId <= out.nodes[i].id) continue;
+                const auto found = index.find(otherId);
+                if (found == index.end()) continue;
+                GraphEdge e;
+                e.a = static_cast<int>(i);
+                e.b = found->second;
+                e.building = rec[cfg::kLinkState] != 1 && rec[cfg::kLinkState] != 2;
+                int matIndex = 0;
+                float hp = 0, maxHp = 0;
+                std::memcpy(&matIndex, rec + cfg::kLinkMaterial, sizeof(matIndex));
+                std::memcpy(&hp, rec + cfg::kLinkHealth, sizeof(hp));
+                if (const std::uint8_t* mat = MaterialRecord(side, matIndex)) std::memcpy(&maxHp, mat + cfg::kMaterialMaxHealth, sizeof(maxHp));
+                e.health = (std::isfinite(hp) && std::isfinite(maxHp) && maxHp > 0.0f) ? std::clamp(hp / maxHp, 0.0f, 1.0f) : 1.0f;
+                out.edges.push_back(e);
+            }
+        }
+        return !out.edges.empty();
     });
 }
 

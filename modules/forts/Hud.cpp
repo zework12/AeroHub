@@ -131,9 +131,9 @@ void RenderBaseView(const std::vector<ViewSegment>& segments, const std::vector<
     DrawStr(g, left, fSmall, RectF(14 * s, out.h - 24 * s, 200 * s, 20 * s), kDim);
     DrawStr(g, right, fSmall, RectF(150 * s, out.h - 24 * s, out.w - 164 * s, 20 * s), kDim, Gdiplus::StringAlignmentFar);
 }
-void RenderPanel(const std::wstring& title, const std::vector<PanelLine>& lines, float scale, HudImage& out) {
+void RenderPanel(const std::wstring& title, const std::vector<PanelLine>& lines, float scale, HudImage& out, float width) {
     const float s = scale;
-    out.w = static_cast<int>(300 * s + 0.5f);
+    out.w = static_cast<int>(width * s + 0.5f);
     out.h = static_cast<int>((46 + 26 * static_cast<float>(lines.size()) + 10) * s + 0.5f);
     out.px.assign(static_cast<std::size_t>(out.w) * static_cast<std::size_t>(out.h), 0u);
     Gdiplus::Bitmap bmp(out.w, out.h, out.w * 4, PixelFormat32bppPARGB, reinterpret_cast<BYTE*>(out.px.data()));
@@ -146,14 +146,14 @@ void RenderPanel(const std::wstring& title, const std::vector<PanelLine>& lines,
     StrokeRR(g, card, 12 * s, kBorder);
     const Gdiplus::Font fH2 = MakeFont(14, s, Gdiplus::FontStyleBold), fSmall = MakeFont(12, s, Gdiplus::FontStyleRegular),
                         fMono = Gdiplus::Font(L"Consolas", 13 * s, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
-    DrawStr(g, title, fH2, RectF(14 * s, 8 * s, 272 * s, 24 * s), kText);
+    DrawStr(g, title, fH2, RectF(14 * s, 8 * s, (width - 28) * s, 24 * s), kText);
     Gdiplus::Pen sep(Col(kBorder), 1.0f);
     float y = 40 * s;
     for (const PanelLine& l : lines) {
         DrawStr(g, l.key, fSmall, RectF(14 * s, y, 130 * s, 26 * s), kDim);
-        DrawStr(g, l.value, fMono, RectF(140 * s, y, 146 * s, 26 * s), l.color ? l.color : kText, Gdiplus::StringAlignmentFar);
+        DrawStr(g, l.value, fMono, RectF(140 * s, y, (width - 154) * s, 26 * s), l.color ? l.color : kText, Gdiplus::StringAlignmentFar);
         y += 26 * s;
-        g.DrawLine(&sep, 14 * s, y - 0.5f, (300 - 14) * s, y - 0.5f);
+        g.DrawLine(&sep, 14 * s, y - 0.5f, (width - 14) * s, y - 0.5f);
     }
 }
 

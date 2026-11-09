@@ -13,6 +13,25 @@ struct Vec2f {
     float x{}, y{};
 };
 
+// Position and vertical velocity of the arc at time t (double precision). With A(t) = (1 - e^(-k t)) / k and
+// B(t) = (t - A) / k:  x = x0 + vx0 A,  y = y0 + vy0 A + g B,  vy = vy0 e^(-k t) + g A.
+// For small k t the quotients lose all digits (k = 0.0001 made the old float form jump by thousands of units),
+// so a Taylor series is used there; k = 0 falls out of it exactly (A = t, B = t^2 / 2).
+inline void ArcAt(Vec2f p0, Vec2f v0, double g, double k, double t, double& x, double& y, double& vy) {
+    const double kt = k * t;
+    double a, b;
+    if (kt < 1.0e-3) {
+        a = t * (1.0 - kt / 2.0 + kt * kt / 6.0 - kt * kt * kt / 24.0 + kt * kt * kt * kt / 120.0);
+        b = t * t * (0.5 - kt / 6.0 + kt * kt / 24.0 - kt * kt * kt / 120.0);
+    } else {
+        a = -std::expm1(-kt) / k;
+        b = (t - a) / k;
+    }
+    x = p0.x + v0.x * a;
+    y = p0.y + v0.y * a + g * b;
+    vy = v0.y * std::exp(-kt) + g * a;
+}
+
 // Writes at most `cap` points spaced `dt` seconds apart, starting at t = 0. Stops after `maxTime`,
 // or once the projectile has passed its apex and fallen `dropLimit` units below the start.
 // Returns the number of points written (0 for non-finite or degenerate input).
@@ -23,27 +42,14 @@ inline int PredictTrajectory(Vec2f p0, Vec2f v0, float gravityY, float drag, flo
         !std::isfinite(gravityY) || !std::isfinite(drag) || drag < 0.0f)
         return 0;
 
-    // Numerically stable form of the closed solution (double precision). With A(t) = (1 - e^(-k t)) / k and
-    // B(t) = (t - A) / k:  x = x0 + vx0 A,  y = y0 + vy0 A + g B,  vy = vy0 e^(-k t) + g A.
-    // For small k t the quotients lose all digits (k = 0.0001 made the old float form jump by thousands of units),
-    // so a Taylor series is used there; k = 0 falls out of it exactly (A = t, B = t^2 / 2).
     const float gDir = gravityY >= 0.0f ? 1.0f : -1.0f;
-    const double g = gravityY, k = drag;
     int n = 0;
     for (; n < cap; ++n) {
         const double t = static_cast<double>(n) * static_cast<double>(dt);
         if (t > static_cast<double>(maxTime)) break;
-        const double x = k * t;
-        double a, b;
-        if (x < 1.0e-3) {
-            a = t * (1.0 - x / 2.0 + x * x / 6.0 - x * x * x / 24.0 + x * x * x * x / 120.0);
-            b = t * t * (0.5 - x / 6.0 + x * x / 24.0 - x * x * x / 120.0);
-        } else {
-            a = -std::expm1(-x) / k;
-            b = (t - a) / k;
-        }
-        const Vec2f p{static_cast<float>(p0.x + v0.x * a), static_cast<float>(p0.y + v0.y * a + g * b)};
-        const double vy = v0.y * std::exp(-x) + g * a;
+        double ax, ay, vy;
+        ArcAt(p0, v0, gravityY, drag, t, ax, ay, vy);
+        const Vec2f p{static_cast<float>(ax), static_cast<float>(ay)};
         if (!std::isfinite(p.x) || !std::isfinite(p.y)) break;
         out[n] = p;
         const bool pastApex = vy * gDir > 0.0;

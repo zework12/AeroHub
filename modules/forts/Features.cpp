@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <map>
 #include <set>
 #include <string>
@@ -23,17 +24,16 @@
 #include "Log.hpp"
 #include "Menu.hpp"
 #include "Overlay.hpp"
+#include "Tactics.hpp"
 #include "Ui.hpp"
 
 namespace forts {
 namespace {
 
 constexpr int kKeyMenu = VK_INSERT;  // F7/F8 collide with the game's own hotkeys (F8 = FPS counter)
-constexpr int kKeyUnlimited = VK_F6;
-constexpr int kKeyAllOff = VK_END;
 constexpr int kMenuUp = VK_UP, kMenuDown = VK_DOWN, kMenuLeft = VK_LEFT, kMenuRight = VK_RIGHT;
 constexpr int kMaxTypeRows = 6, kMaxTargetRows = 6;
-constexpr int kRowIdType = 100, kRowIdTarget = 200;  // menu row ids: < 100 are items
+constexpr int kRowIdType = 100, kRowIdTarget = 200, kRowIdLanguage = 300, kRowIdScale = 301;  // menu row ids: < 100 are items
 
 struct Settings {
     float gravityMagnitude = cfg::kDefaultGravityY;  // fallback |Physics.Gravity|; the sign is derived from the camera
@@ -51,29 +51,160 @@ enum Item {
     kItemUnlimited, kItemFastBeams, kItemFastDevices, kItemFastReload, kItemCommander, kItemRepair, kItemRepairSpeed,
     kItemRepairWhat,
     // Combat
-    kItemTrajectory, kItemImpact, kItemAutoAim,
+    kItemTrajectory, kItemImpact, kItemThreats, kItemAimCalc, kItemAutoAim,
     // Enemy
-    kItemEnemyOverlay, kItemRadar, kItemIntel,
+    kItemEnemyOverlay, kItemRadar, kItemIntel, kItemTimers, kItemWeakEnemy, kItemWeakOwn,
     // Tools
-    kItemRecord, kItemDiagnostics, kItemAllOff,
+    kItemStats, kItemRecord, kItemDiagnostics, kItemAllOff,
+    // Added later (kept at the end so the hub channel ids of the older items do not move); shown in the Combat tab
+    kItemPickTarget,
     kItemCount
 };
 constexpr const char* kItemNames[kItemCount] = {
     "Unlimited resources", "Fast build: beams", "Fast build: tech and guns", "Minigun (fast reload)", "Commander auto-refill",
-    "Auto-repair", "Repair speed", "Repair what", "Trajectory overlay", "Impact markers", "Auto-aim at target", "Enemy overlay",
-    "Enemy base window (observer)", "Enemy intel (spy panel)", "Record shots to log", "Write diagnostics to log", "All off"};
+    "Auto-repair", "Repair speed", "Repair what", "Trajectory overlay", "Impact markers", "Incoming shells warning",
+    "Aim calculator (needs a target)", "Auto-aim at target", "Enemy overlay", "Enemy base window (observer)", "Enemy intel (spy panel)",
+    "Enemy gun timers", "Weak links: enemy base", "Weak links: your base", "Battle stats panel", "Record shots to log",
+    "Write diagnostics to log", "All off", "Pick target under cursor"};
 constexpr aero::ipc::Kind kItemKinds[kItemCount] = {
     aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle,
     aero::ipc::kButton, aero::ipc::kButton,  // repair speed / repair what (choice rows)
-    aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle,
-    aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kButton, aero::ipc::kButton};
-constexpr int kItemTab[kItemCount] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3};
+    aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle,  // combat
+    aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle,  // enemy
+    aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kButton, aero::ipc::kButton,  // tools
+    aero::ipc::kButton};                                                              // pick target
+constexpr int kItemTab[kItemCount] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 1};
+static_assert(kItemCount <= aero::ipc::kMaxFeatures, "the hub channel has room for kMaxFeatures features");
 
 // Repair speed levels: share of the maximum health restored per second. "Instant" restores everything each pass.
 constexpr const wchar_t* kRepairSpeedNames[4] = {L"Slow 8%/s", L"Medium 25%/s", L"Fast 60%/s", L"Instant"};
 constexpr float kRepairRates[4] = {0.08f, 0.25f, 0.60f, 100.0f};
 constexpr const wchar_t* kRepairWhatNames[3] = {L"Everything", L"Devices", L"Beams"};
-constexpr const wchar_t* kTabNames[4] = {L"General", L"Combat", L"Enemy", L"Tools"};
+constexpr int kTabCount = 5;  // the fifth tab (Settings) has no feature items: language, menu size
+constexpr const wchar_t* kTabNames[kTabCount] = {L"General", L"Combat", L"Enemy", L"Tools", L"Settings"};
+
+// Menu language: 0 English, 1 Russian. Saved in FortsLang.ini next to the module (see LangPath).
+int g_lang = 0;
+bool g_selfTest = false;  // a file FortsSelfTest.txt next to the module turns the passive self-test on (see SelfTestTick)
+const wchar_t* Tr(const wchar_t* en, const wchar_t* ru) { return g_lang == 1 ? ru : en; }
+
+constexpr const wchar_t* kItemNamesRu[kItemCount] = {
+    L"Бесконечные ресурсы", L"Быстрая постройка: балки", L"Быстрая постройка: техи и орудия", L"Миниган (быстрая перезарядка)",
+    L"Автозаряд командира", L"Авторемонт", L"Скорость ремонта", L"Что ремонтировать", L"Траектория выстрела", L"Метки попадания",
+    L"Предупреждение о снарядах", L"Расчёт прицела (нужна цель)", L"Автонаведение на цель", L"Оверлей врага",
+    L"Окно базы врага (наблюдатель)", L"Разведка врага (панель шпиона)", L"Таймеры орудий врага", L"Слабые звенья: база врага",
+    L"Слабые звенья: моя база", L"Панель статистики боя", L"Запись выстрелов в лог", L"Записать диагностику в лог", L"Выключить всё",
+    L"Выбрать цель под курсором"};
+constexpr const wchar_t* kItemDescEn[kItemCount] = {
+    L"Metal and energy never run out",
+    L"Struts build instantly (offline only)",
+    L"Devices and guns build much faster",
+    L"Guns reload almost instantly",
+    L"Keeps the commander gauge full",
+    L"Repairs damaged devices and beams over time",
+    L"How fast auto-repair works (click to change)",
+    L"What auto-repair fixes (click to change)",
+    L"Draws the flight arc of your guns' shells",
+    L"Rings where shells land, with flight time",
+    L"Warns about enemy shells heading for your base",
+    L"Angle to hit the target with your selected gun",
+    L"Turns your guns onto the target (offline only)",
+    L"Type, health and reload over enemy devices",
+    L"Window with the enemy base (observer)",
+    L"Spy panel with information about the enemy",
+    L"Reload bar on every enemy gun",
+    L"Beams whose loss would split the enemy base",
+    L"Beams whose loss would split your base",
+    L"Shots, hits and damage (estimates)",
+    L"Writes shot data to the log for calibration",
+    L"Writes a state report to the log once",
+    L"Switches every feature off",
+    L"Target = the enemy device nearest to the mouse"};
+constexpr const wchar_t* kItemDescRu[kItemCount] = {
+    L"Металл и энергия не заканчиваются",
+    L"Балки строятся мгновенно (только офлайн)",
+    L"Устройства и орудия строятся быстрее",
+    L"Орудия перезаряжаются почти мгновенно",
+    L"Шкала командира всегда полная",
+    L"Со временем чинит устройства и балки",
+    L"Скорость авторемонта (клик — сменить)",
+    L"Что чинит авторемонт (клик — сменить)",
+    L"Рисует дугу полёта снарядов ваших орудий",
+    L"Кольца точек падения и время полёта",
+    L"Предупреждает о снарядах, летящих в вашу базу",
+    L"Угол для попадания из выбранного орудия",
+    L"Наводит орудия на цель (только офлайн)",
+    L"Тип, здоровье и перезарядка врага",
+    L"Окно с базой врага (для наблюдателя)",
+    L"Панель шпиона со сведениями о враге",
+    L"Полоса перезарядки на орудиях врага",
+    L"Балки, без которых база врага развалится",
+    L"Балки, без которых ваша база развалится",
+    L"Выстрелы, попадания и урон (оценка)",
+    L"Пишет данные выстрелов в лог для калибровки",
+    L"Один раз пишет отчёт о состоянии в лог",
+    L"Выключает все функции",
+    L"Цель — вражеское устройство ближе всего к мыши"};
+constexpr const wchar_t* kRepairSpeedRu[4] = {L"Медл. 8%/с", L"Сред. 25%/с", L"Быстр. 60%/с", L"Мгновенно"};
+constexpr const wchar_t* kRepairWhatRu[3] = {L"Всё", L"Устройства", L"Балки"};
+constexpr const wchar_t* kTabNamesRu[kTabCount] = {L"Общее", L"Бой", L"Враг", L"Инструменты", L"Настройки"};
+
+// ---- key binds: one key per action; "toggle" flips the action on each press, "hold" keeps a switch on only while the key is down.
+struct Bind {
+    int vk = 0;  // 0 = none
+    bool hold = false;
+};
+Bind g_binds[kItemCount];
+bool g_holdDown[kItemCount]{}, g_holdPrev[kItemCount]{}, g_keyPrev[kItemCount]{};
+int g_bindCapture = -1;  // the item whose key is being chosen (-1 = none)
+float g_menuScale = 1.0f;  // the user's menu size multiplier (Settings tab)
+
+void DefaultBinds() {
+    for (Bind& b : g_binds) b = Bind{};
+    g_binds[kItemUnlimited] = {VK_F6, false};
+    g_binds[kItemAllOff] = {VK_END, false};
+    g_binds[kItemPickTarget] = {VK_F9, false};
+}
+
+std::wstring KeyName(int vk) {
+    if (vk == VK_MBUTTON) return L"Mouse 3";
+    if (vk == VK_XBUTTON1) return L"Mouse 4";
+    if (vk == VK_XBUTTON2) return L"Mouse 5";
+    UINT scan = MapVirtualKeyW(static_cast<UINT>(vk), MAPVK_VK_TO_VSC);
+    LONG lparam = static_cast<LONG>(scan << 16);
+    switch (vk) {  // extended keys need bit 24 for GetKeyNameText to give the right name
+        case VK_INSERT: case VK_DELETE: case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+        case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_NUMLOCK: case VK_RCONTROL: case VK_RMENU: case VK_DIVIDE:
+            lparam |= 1 << 24;
+            break;
+        default: break;
+    }
+    wchar_t buf[40]{};
+    if (scan && GetKeyNameTextW(lparam, buf, 40) > 0) return buf;
+    return L"Key " + std::to_wstring(vk);
+}
+
+std::wstring BindLabel(int item) {
+    if (item < 0 || item >= kItemCount || g_binds[item].vk == 0) return Tr(L"[set a key in the menu]", L"[назначьте клавишу в меню]");
+    return L"[" + KeyName(g_binds[item].vk) + L"]";
+}
+
+// Caption shown above an item (starts a group of related rows); nullptr = no caption.
+const wchar_t* SectionBefore(int item) {
+    switch (item) {
+        case kItemUnlimited: return Tr(L"RESOURCES AND SPEED", L"РЕСУРСЫ И СКОРОСТЬ");
+        case kItemRepair: return Tr(L"REPAIR", L"РЕМОНТ");
+        case kItemTrajectory: return Tr(L"MY SHOTS", L"МОИ ВЫСТРЕЛЫ");
+        case kItemThreats: return Tr(L"DEFENCE", L"ЗАЩИТА");
+        case kItemAimCalc: return Tr(L"AIMING", L"НАВЕДЕНИЕ");
+        case kItemEnemyOverlay: return Tr(L"ENEMY INFORMATION", L"ИНФОРМАЦИЯ О ВРАГЕ");
+        case kItemWeakEnemy: return Tr(L"WEAK LINKS", L"СЛАБЫЕ ЗВЕНЬЯ");
+        case kItemStats: return Tr(L"STATISTICS", L"СТАТИСТИКА");
+        case kItemRecord: return Tr(L"LOGS (FOR THE DEVELOPER)", L"ЛОГИ (ДЛЯ РАЗРАБОТЧИКА)");
+        case kItemAllOff: return Tr(L"RESET", L"СБРОС");
+        default: return nullptr;
+    }
+}
 
 struct State {
     bool unlimited = false;
@@ -90,6 +221,12 @@ struct State {
     bool enemyOverlay = false;
     bool radar = false;
     bool intel = false;
+    bool threats = false;    // incoming enemy shells: where they land, when, what they threaten
+    bool aimCalc = false;    // elevation needed to hit the target chosen in the Enemy tab
+    bool timers = false;     // reload state of enemy guns
+    bool weakEnemy = false;  // links whose loss cuts a part of the enemy base off from the ground
+    bool weakOwn = false;
+    bool stats = false;      // battle statistics panel (estimates)
     bool record = false;
     bool menuOpen = false;
     int menuTab = 0;
@@ -120,6 +257,8 @@ Overlay g_overlay;
 Menu g_menu;
 Settings g_settings;
 State g_state;
+Calibration g_cal;  // camera / gravity direction, re-derived every frame in PrepareCalibration
+bool g_calOk = false;
 aero::IatHook g_hook;
 aero::ipc::Server g_ipc;
 int g_featureId[kItemCount];
@@ -162,8 +301,34 @@ struct EnemyDev {
     Vec3 pos;
     bool weapon = false;
     std::string type;
+    bool timerOk = false;   // the fields below were read this refresh
+    bool ready = false;     // IsWeaponReadyToFire
+    float reloadValue = 0;  // GetWeaponReloadTime as reported
+    float reloadPeriod = 0;
 };
 std::vector<EnemyDev> g_enemy;
+// Our own devices (same refresh) and the team codes of the opponents, for the warnings and the support analysis.
+struct OwnDev {
+    int id = 0;
+    Vec3 pos;
+    std::string type;
+    bool weapon = false;
+};
+std::vector<OwnDev> g_own;
+std::vector<int> g_enemyCodes;
+std::map<int, std::string> g_typeById;  // device id -> type name (a device never changes type)
+bool g_worldFresh = false;              // set by every RefreshWorld pass, consumed by the damage statistics
+
+const std::string& TypeOf(int deviceId) {
+    auto it = g_typeById.find(deviceId);
+    if (it == g_typeById.end()) {
+        if (g_typeById.size() > 6000) g_typeById.clear();
+        std::string t;
+        g_api.DeviceTypeName(deviceId, t);
+        it = g_typeById.emplace(deviceId, std::move(t)).first;
+    }
+    return it->second;
+}
 std::vector<int> g_targets;  // enemy weapon ids offered in the Enemy tab (nearest to the camera first)
 HudImage g_radarImage, g_intelImage;
 bool g_intelFresh = false;
@@ -203,12 +368,194 @@ std::wstring IniPath() {
 std::wstring DragPath() {  // separate file: the build overwrites FortsModule.ini in the output folder
     std::wstring p = IniPath();
     const std::size_t slash = p.find_last_of(L'\\');
-    return slash == std::wstring::npos ? p : p.substr(0, slash + 1) + L"FortsDrag.ini";
+    // v2: the first versions measured drag against wall-clock time while the game changes velocity only on its 0.04 s physics frames;
+    // those values were about 28% too low, so the old FortsDrag.ini is not read any more.
+    return slash == std::wstring::npos ? p : p.substr(0, slash + 1) + L"FortsDrag.v2.ini";
+}
+
+std::wstring LangPath() {  // separate file for the same reason as DragPath
+    std::wstring p = IniPath();
+    const std::size_t slash = p.find_last_of(L'\\');
+    return slash == std::wstring::npos ? p : p.substr(0, slash + 1) + L"FortsLang.ini";
+}
+
+void SaveLanguage() {
+    const std::wstring path = LangPath();
+    if (!path.empty()) WritePrivateProfileStringW(L"Menu", L"Language", g_lang == 1 ? L"ru" : L"en", path.c_str());
+}
+
+void SaveMenuScale() {
+    const std::wstring path = LangPath();
+    wchar_t v[16];
+    swprintf_s(v, L"%.2f", g_menuScale);
+    if (!path.empty()) WritePrivateProfileStringW(L"Menu", L"Scale", v, path.c_str());
+}
+
+std::wstring BindsPath() {
+    std::wstring p = IniPath();
+    const std::size_t slash = p.find_last_of(L'\\');
+    return slash == std::wstring::npos ? p : p.substr(0, slash + 1) + L"FortsBinds.ini";
+}
+
+void SaveBinds() {
+    const std::wstring path = BindsPath();
+    if (path.empty()) return;
+    for (int i = 0; i < kItemCount; ++i) {
+        wchar_t key[16], value[24];
+        swprintf_s(key, L"item%d", i);
+        swprintf_s(value, L"%d,%d", g_binds[i].vk, g_binds[i].hold ? 1 : 0);
+        WritePrivateProfileStringW(L"Binds", key, value, path.c_str());
+    }
+}
+
+// "item<N>=vk,hold" lines; an item without a line keeps its default, "0,0" means the user removed the key.
+void LoadBinds() {
+    DefaultBinds();
+    const std::wstring path = BindsPath();
+    if (path.empty()) return;
+    for (int i = 0; i < kItemCount; ++i) {
+        wchar_t key[16], value[24]{};
+        swprintf_s(key, L"item%d", i);
+        GetPrivateProfileStringW(L"Binds", key, L"", value, 24, path.c_str());
+        if (!value[0]) continue;
+        int vk = 0, hold = 0;
+        if (swscanf_s(value, L"%d,%d", &vk, &hold) < 1) continue;
+        if (vk < 0 || vk > 254 || vk == VK_LBUTTON || vk == VK_RBUTTON || vk == kKeyMenu) vk = 0;
+        g_binds[i] = {vk, hold != 0 && kItemKinds[i] == aero::ipc::kToggle};
+    }
+}
+
+// ---------------------------------------------------------------- movable panels
+// Every HUD panel (aim calculator, weak links, battle stats, enemy intel, radar) can be dragged with the left mouse button while the
+// menu is open; a right click on a panel puts it back to its default place. Positions are viewport pixels, kept in FortsPanels.ini.
+struct PanelSpot {
+    float x = 0, y = 0;        // saved position (valid when moved)
+    float curX = 0, curY = 0;  // where it was drawn this frame
+    float w = 0, h = 0;
+    bool moved = false, shown = false;
+};
+std::map<std::string, PanelSpot> g_spots;
+std::vector<std::string> g_spotOrder;  // draw order, later = on top
+std::string g_dragSpot;
+float g_dragGrabX = 0, g_dragGrabY = 0;
+int g_viewW = 0, g_viewH = 0;
+constexpr const char* kSpotKeys[] = {"aimcalc", "weak", "stats", "intel", "radar"};
+
+std::wstring PanelsPath() {
+    std::wstring p = IniPath();
+    const std::size_t slash = p.find_last_of(L'\\');
+    return slash == std::wstring::npos ? p : p.substr(0, slash + 1) + L"FortsPanels.ini";
+}
+
+void SavePanelSpot(const std::string& key) {
+    const std::wstring path = PanelsPath();
+    if (path.empty()) return;
+    const std::wstring wkey(key.begin(), key.end());
+    const PanelSpot& s = g_spots[key];
+    wchar_t value[40];
+    swprintf_s(value, L"%.0f,%.0f", s.x, s.y);
+    WritePrivateProfileStringW(L"Panels", wkey.c_str(), s.moved ? value : nullptr, path.c_str());  // nullptr removes the line
+}
+
+void LoadPanelSpots() {
+    const std::wstring path = PanelsPath();
+    if (path.empty()) return;
+    for (const char* k : kSpotKeys) {
+        const std::wstring wkey(k, k + std::strlen(k));
+        wchar_t value[40]{};
+        GetPrivateProfileStringW(L"Panels", wkey.c_str(), L"", value, 40, path.c_str());
+        float x = 0, y = 0;
+        if (value[0] && swscanf_s(value, L"%f,%f", &x, &y) == 2 && std::isfinite(x) && std::isfinite(y) && x > -20000.0f && x < 20000.0f &&
+            y > -20000.0f && y < 20000.0f) {
+            PanelSpot& s = g_spots[k];
+            s.x = x;
+            s.y = y;
+            s.moved = true;
+        }
+    }
+}
+
+// Returns where the panel is drawn: its saved position if it was moved (kept inside the viewport), else the default.
+void PlacePanel(const char* key, float defX, float defY, int w, int h, float& x, float& y) {
+    PanelSpot& s = g_spots[key];
+    if (std::find(g_spotOrder.begin(), g_spotOrder.end(), key) == g_spotOrder.end()) g_spotOrder.emplace_back(key);
+    x = s.moved ? s.x : defX;
+    y = s.moved ? s.y : defY;
+    if (g_viewW > 0 && g_viewH > 0) {
+        x = std::clamp(x, 0.0f, std::max(0.0f, static_cast<float>(g_viewW - w)));
+        y = std::clamp(y, 0.0f, std::max(0.0f, static_cast<float>(g_viewH - h)));
+    }
+    s.curX = x;
+    s.curY = y;
+    s.w = static_cast<float>(w);
+    s.h = static_cast<float>(h);
+    s.shown = true;
+}
+
+// Feed the pointer once per frame while the menu is open. `menuTakes` = the pointer is on the menu window. Returns true while the
+// pointer is over a panel or dragging one, so the game must not see the mouse.
+bool PanelPointer(float px, float py, bool down, bool menuTakes) {
+    static bool wasDown = false, wasRight = false;
+    const bool right = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+    std::string hit;
+    if (!menuTakes) {
+        for (auto it = g_spotOrder.rbegin(); it != g_spotOrder.rend(); ++it) {
+            const PanelSpot& s = g_spots[*it];
+            if (s.shown && px >= s.curX && px < s.curX + s.w && py >= s.curY && py < s.curY + s.h) {
+                hit = *it;
+                break;
+            }
+        }
+    }
+    if (!g_dragSpot.empty()) {
+        PanelSpot& s = g_spots[g_dragSpot];
+        if (down) {
+            s.x = std::clamp(px - g_dragGrabX, 0.0f, std::max(0.0f, static_cast<float>(g_viewW) - s.w));
+            s.y = std::clamp(py - g_dragGrabY, 0.0f, std::max(0.0f, static_cast<float>(g_viewH) - s.h));
+            s.moved = true;
+            s.curX = s.x;
+            s.curY = s.y;
+        } else {
+            SavePanelSpot(g_dragSpot);
+            g_dragSpot.clear();
+        }
+    } else if (!hit.empty()) {
+        PanelSpot& s = g_spots[hit];
+        if (down && !wasDown) {
+            g_dragSpot = hit;
+            g_dragGrabX = px - s.curX;
+            g_dragGrabY = py - s.curY;
+        } else if (right && !wasRight && s.moved) {
+            s.moved = false;
+            SavePanelSpot(hit);
+        }
+    }
+    wasDown = down;
+    wasRight = right;
+    return !g_dragSpot.empty() || !hit.empty();
 }
 
 void LoadSettings() {
     const std::wstring path = IniPath();
     if (path.empty()) return;
+    {
+        wchar_t lang[16]{};
+        GetPrivateProfileStringW(L"Menu", L"Language", L"en", lang, 16, LangPath().c_str());
+        g_lang = _wcsicmp(lang, L"ru") == 0 ? 1 : 0;
+        wchar_t scale[16]{};
+        GetPrivateProfileStringW(L"Menu", L"Scale", L"1.00", scale, 16, LangPath().c_str());
+        const float sc = static_cast<float>(_wtof(scale));
+        g_menuScale = sc >= 0.75f && sc <= 2.5f ? sc : 1.0f;
+        LoadBinds();
+        LoadPanelSpots();
+        std::wstring flag = path;
+        const std::size_t slash = flag.find_last_of(L'\\');
+        if (slash != std::wstring::npos) {
+            flag = flag.substr(0, slash + 1) + L"FortsSelfTest.txt";
+            g_selfTest = GetFileAttributesW(flag.c_str()) != INVALID_FILE_ATTRIBUTES;
+            if (g_selfTest) Logf("selftest: enabled by FortsSelfTest.txt");
+        }
+    }
     wchar_t buf[64]{};
     GetPrivateProfileStringW(L"Forts", L"GravityMagnitude", L"", buf, 64, path.c_str());
     if (buf[0]) {
@@ -243,10 +590,16 @@ void SaveDrag(const std::string& type, const DragStat& st) {
     WritePrivateProfileStringW(L"Drag", std::wstring(type.begin(), type.end()).c_str(), value, path.c_str());
 }
 
+// The linear drag of a weapon type's shells (per second). Order of trust: the value measured on live shots (exact, see
+// EstimateDragFrames), then k = kDragFactor * ProjectileDrag from the game's data, and 0 when neither is known.
+std::map<std::string, float> g_typeDragFormula;  // type -> kDragFactor * ProjectileDrag
+std::set<std::string> g_propelled;               // types whose shells fly under thrust: the frame model does not describe them
+
 float DragFor(const std::string& type) {
     const auto it = g_drag.find(type);
-    if (it != g_drag.end() && it->second.n >= 4) return static_cast<float>(it->second.sum / it->second.n);
-    return cfg::kDefaultDrag;
+    if (it != g_drag.end() && it->second.n >= 2) return static_cast<float>(it->second.sum / it->second.n);
+    const auto f = g_typeDragFormula.find(type);
+    return f != g_typeDragFormula.end() ? f->second : 0.0f;
 }
 
 bool Calibrate(int w, int h, Calibration& c) {
@@ -367,6 +720,36 @@ void SetRecord(bool on) {
     Logf("record: %d", on ? 1 : 0);
 }
 
+void SetThreats(bool on) {
+    g_state.threats = on;
+    Logf("incoming shells warning: %d", on ? 1 : 0);
+}
+
+void SetAimCalc(bool on) {
+    g_state.aimCalc = on;
+    Logf("aim calculator: %d (target %d)", on ? 1 : 0, g_state.aimTarget);
+}
+
+void SetTimers(bool on) {
+    g_state.timers = on;
+    Logf("enemy gun timers: %d", on ? 1 : 0);
+}
+
+void SetWeakEnemy(bool on) {
+    g_state.weakEnemy = on;
+    Logf("weak links (enemy base): %d", on ? 1 : 0);
+}
+
+void SetWeakOwn(bool on) {
+    g_state.weakOwn = on;
+    Logf("weak links (own base): %d", on ? 1 : 0);
+}
+
+void SetStats(bool on) {
+    g_state.stats = on;
+    Logf("battle stats panel: %d", on ? 1 : 0);
+}
+
 void AllOff() {
     g_state.trajectory = false;
     g_state.record = false;
@@ -375,6 +758,8 @@ void AllOff() {
     g_state.enemyOverlay = false;
     g_state.radar = false;
     g_state.intel = false;
+    g_state.threats = g_state.aimCalc = g_state.timers = false;
+    g_state.weakEnemy = g_state.weakOwn = g_state.stats = false;
     if (g_state.unlimited) SetUnlimited(false);
     if (g_state.fastBeams) SetFastBeams(false);
     if (g_state.fastDevices) SetFastDevices(false);
@@ -664,6 +1049,19 @@ float TypeGravity(int weaponId, int team, const std::string& type) {
         Logf("gravity: chain failed for '%s' (projectile '%s', value %.1f); using %.1f", type.c_str(), projectile.c_str(), g, magnitude);
     }
     g_typeGravity[type] = magnitude;
+    if (chain) {  // the drag of the same projectile, from the game's data
+        float pd = 0;
+        if (!g_api.ProjectileTypeDrag(projectile, team, pd)) {
+            Logf("drag: ProjectileDrag of '%s' is unreadable; the drag comes from live shots only", projectile.c_str());
+        } else if (pd >= cfg::kPropelledDrag) {
+            g_propelled.insert(type);
+            Logf("drag: weapon type '%s' fires '%s' with ProjectileDrag %.3f: thrust-driven, its path is not predicted", type.c_str(), projectile.c_str(), pd);
+        } else {
+            g_typeDragFormula[type] = cfg::kDragFactor * pd;
+            Logf("drag: weapon type '%s' fires '%s' with ProjectileDrag %.4f -> k = %.4f per second from the game's data", type.c_str(), projectile.c_str(), pd,
+                 cfg::kDragFactor * pd);
+        }
+    }
     return magnitude;
 }
 
@@ -672,6 +1070,8 @@ float TypeGravity(int weaponId, int team, const std::string& type) {
 struct FireSnapshot {
     std::string type;
     float vx = 0, vy = 0;
+    Vec3 barrel;
+    bool hasBarrel = false;
 };
 struct ProjTrack {
     std::string type;
@@ -681,11 +1081,12 @@ struct ProjTrack {
 std::map<int, FireSnapshot> g_prevFire;
 std::map<int, ProjTrack> g_tracks;
 
-std::string MatchWeaponType(float vx, float vy) {
+std::string MatchWeaponType(float vx, float vy, int* weaponId = nullptr) {
     const float speed = std::sqrt(vx * vx + vy * vy);
     const float ang = std::atan2(vy, vx);
     float best = 0.09f;  // 5 degrees
     std::string type;
+    if (weaponId) *weaponId = 0;
     for (const auto& [id, f] : g_prevFire) {
         const float ws = std::sqrt(f.vx * f.vx + f.vy * f.vy);
         if (ws < 1.0f || std::fabs(speed / ws - 1.0f) > 0.08f) continue;
@@ -693,6 +1094,7 @@ std::string MatchWeaponType(float vx, float vy) {
         if (d < best) {
             best = d;
             type = f.type;
+            if (weaponId) *weaponId = id;
         }
     }
     return type;
@@ -704,7 +1106,9 @@ void LearnPhysics(int team, const std::vector<int>& weapons) {
         Vec3 v;
         std::string t;
         if (!g_api.FireVelocity(id, v) || !g_api.DeviceTypeName(id, t)) continue;
-        cur[id] = {t, v.x, v.y};
+        FireSnapshot snap{t, v.x, v.y, {}, false};
+        snap.hasBarrel = g_api.BarrelPosition(id, snap.barrel);
+        cur[id] = std::move(snap);
     }
     const double now = NowSeconds();
     std::vector<int> ids;
@@ -716,23 +1120,41 @@ void LearnPhysics(int team, const std::vector<int>& weapons) {
             alive.insert(id);
             const auto it = g_tracks.find(id);
             if (it == g_tracks.end()) {
-                g_tracks[id] = {MatchWeaponType(v.x, v.y), now, v.x, v.y};
+                int weaponId = 0;
+                const std::string type = MatchWeaponType(v.x, v.y, &weaponId);
+                g_tracks[id] = {type, now, v.x, v.y};
+                // Launch record for calibrating where a shell appears relative to the barrel: what the gun reported one refresh before,
+                // and the first state of the shell (the log line is `launch:`; 40 per session).
+                static int launches = 0;
+                const auto snap = g_prevFire.find(weaponId);
+                if (launches < 40 && !type.empty() && snap != g_prevFire.end() && snap->second.hasBarrel) {
+                    ++launches;
+                    float grav = 0;
+                    Vec3 first{};
+                    g_api.ProjectileGravity(id, grav);
+                    g_api.NodePos(id, first);
+                    Logf("launch: type=%s weapon=%d barrel=(%.2f, %.2f) fireVel=(%.2f, %.2f) first=(%.2f, %.2f) vel=(%.2f, %.2f) gravity=%.1f", type.c_str(),
+                         weaponId, snap->second.barrel.x, snap->second.barrel.y, snap->second.vx, snap->second.vy, first.x, first.y, v.x, v.y, grav);
+                }
                 continue;
             }
             ProjTrack& tr = it->second;
-            const double dt = now - tr.t;
-            if (dt > 0.004 && dt < 0.2 && !tr.type.empty() && std::fabs(tr.vx) > 800.0f && tr.vx * v.x > 0.0f) {
-                const double ratio = static_cast<double>(v.x) / static_cast<double>(tr.vx);
-                if (ratio > 0.5 && ratio < 1.0001) {
-                    const double k = -std::log(ratio) / dt;
-                    if (k >= 0.0 && k < 0.5) {
+            // Exact drag: the velocity only changes on the game's 0.04 s physics frames, so the estimate works on pairs of
+            // observations with the number of frames between them recovered from the vertical velocity (EstimateDragFrames).
+            if (!tr.type.empty() && !g_propelled.count(tr.type)) {
+                float grav = 0;
+                if (g_api.ProjectileGravity(id, grav) && std::fabs(grav) > 1.0f) {
+                    const DragEstimate e = EstimateDragFrames(tr.vx, tr.vy, v.x, v.y, g_cal.gravitySign * std::fabs(grav));
+                    if (e.ok) {
                         DragStat& st = g_drag[tr.type];
-                        st.sum += k;
+                        st.sum += e.k;
                         ++st.n;
-                        if (st.n >= 5 && st.n - st.savedAtN >= 200) {
+                        if (st.n >= 3 && st.n - st.savedAtN >= 50) {
                             st.savedAtN = st.n;
                             SaveDrag(tr.type, st);
-                            Logf("drag: weapon type '%s' k=%.4f from %d samples", tr.type.c_str(), st.sum / st.n, st.n);
+                            const auto formula = g_typeDragFormula.find(tr.type);
+                            Logf("drag: weapon type '%s' measured k=%.5f from %d shell samples (data formula %s%.5f)", tr.type.c_str(), st.sum / st.n, st.n,
+                                 formula == g_typeDragFormula.end() ? "unknown " : "", formula == g_typeDragFormula.end() ? 0.0f : formula->second);
                         }
                     }
                 }
@@ -835,10 +1257,53 @@ void Diagnostics(int team) {
 }
 
 // ---------------------------------------------------------------- the other teams' devices
+// Reload state of enemy guns. GetWeaponReloadTime gives the reload period times a fraction; whether that fraction is the part that
+// is left or the part that has elapsed is not visible in the disassembly, so it is learned from the first reloads seen to the end:
+// the last value before a gun turns ready is close to 0 when it counts down and close to the period when it counts up.
+struct TimerPrev {
+    bool have = false, ready = false;
+    float value = 0, period = 0;
+};
+std::map<int, TimerPrev> g_timerPrev;
+int g_reloadSemantics = 0;  // 0 unknown, 1 the value is the time left, 2 the value is the time elapsed
+int g_semLeft = 0, g_semElapsed = 0;
+
+void ReadTimers(EnemyDev& e) {
+    bool ready = false;
+    float value = 0, period = 0;
+    if (!g_api.WeaponReady(e.id, ready) || !g_api.WeaponReload(e.id, value, period)) return;
+    e.timerOk = true;
+    e.ready = ready;
+    e.reloadValue = value;
+    e.reloadPeriod = period;
+    if (g_timerPrev.size() > 4000) g_timerPrev.clear();
+    TimerPrev& pv = g_timerPrev[e.id];
+    if (pv.have && !pv.ready && ready && pv.period > 1.0f) {  // a reload just finished: what did the value say a moment ago?
+        const float f = pv.value / pv.period;
+        if (f < 0.25f) ++g_semLeft;
+        else if (f > 0.75f) ++g_semElapsed;
+        if (g_reloadSemantics == 0 && (g_semLeft >= 3 || g_semElapsed >= 3) && (g_semLeft == 0 || g_semElapsed == 0)) {
+            g_reloadSemantics = g_semLeft > 0 ? 1 : 2;
+            Logf("timers: the reload value counts %s (learned from %d reload(s))", g_reloadSemantics == 1 ? "down (time left)" : "up (time elapsed)",
+                 g_semLeft + g_semElapsed);
+        }
+    }
+    pv.have = true;
+    pv.ready = ready;
+    pv.value = value;
+    pv.period = period;
+    static int logged = 0;
+    if (logged < 12) {
+        ++logged;
+        Logf("timers: weapon id=%d ready=%d reload value=%.3f period=%.3f", e.id, ready ? 1 : 0, value, period);
+    }
+}
+
 void RefreshWorld(int team, bool wantRadar) {
     static int frame = 0;
     if (frame++ % 20 != 0) return;
     g_enemy.clear();
+    g_own.clear();
     int deviceCount = 0;
     // Devices come straight from the game's own list. Ours carry the local team code; every other device whose
     // code is a player side (1 or 2 modulo 100) belongs to an opponent. Devices in state 5 are ignored, as the
@@ -867,9 +1332,19 @@ void RefreshWorld(int team, bool wantRadar) {
         e.weapon = isWeapon;
         if (!own) g_api.DeviceTypeName(d.id, e.type);
         ++deviceCount;
-        if (own) continue;
+        if (own) {
+            OwnDev o;
+            o.id = d.id;
+            o.pos = p;
+            o.weapon = isWeapon;
+            o.type = TypeOf(d.id);
+            g_own.push_back(std::move(o));
+            continue;
+        }
+        if (isWeapon && g_state.timers) ReadTimers(e);
         g_enemy.push_back(std::move(e));
     }
+    g_worldFresh = true;
     // Spy-style intel on the opposing team (what the Spy commander shows): resources, commander gauge, reactor,
     // the newest device and the size of the base. The enemy team is the most common code among its devices.
     {
@@ -880,6 +1355,8 @@ void RefreshWorld(int team, bool wantRadar) {
         }
         g_enemyTeam = 0;
         int best = 0;
+        g_enemyCodes.clear();
+        for (const auto& [code, n] : perCode) g_enemyCodes.push_back(code);
         for (const auto& [code, n] : perCode)
             if (n > best) {
                 best = n;
@@ -925,6 +1402,16 @@ void RefreshWorld(int team, bool wantRadar) {
             }
             lines.push_back({L"Last built", last && !last->type.empty() ? std::wstring(last->type.begin(), last->type.end()) : std::wstring(L"-"), 0});
             lines.push_back({L"Devices / guns", std::to_wstring(g_enemy.size()) + L" / " + std::to_wstring(guns), 0});
+            if (g_state.timers) {
+                int known = 0, ready = 0;
+                for (const EnemyDev& e : g_enemy)
+                    if (e.weapon && e.timerOk) {
+                        ++known;
+                        ready += e.ready ? 1 : 0;
+                    }
+                lines.push_back({L"Guns ready", known > 0 ? std::to_wstring(ready) + L" / " + std::to_wstring(known) : std::wstring(L"-"),
+                                 known > 0 && ready == known ? aero::ui::kWarn : 0});
+            }
             RenderPanel(L"Enemy intel", lines, g_uiScale, g_intelImage);
             g_intelFresh = true;
         }
@@ -996,9 +1483,6 @@ void ApplyAutoAim(int team) {
 }
 
 // ---------------------------------------------------------------- drawing: trajectories, enemies, radar
-Calibration g_cal;
-bool g_calOk = false;
-
 bool PrepareCalibration(int w, int h) {
     g_calOk = Calibrate(w, h, g_cal);
     if (!g_calOk) {
@@ -1023,41 +1507,6 @@ bool WorldToPixels(const Vec3& world, float& x, float& y) {
     return true;
 }
 
-void DrawTrajectories(int team) {
-    std::vector<int> ids;
-    if (!g_api.OwnWeapons(team, ids) || ids.empty()) return;
-    constexpr int kCap = 128;
-    Vec2f pts[kCap];
-    float line[2 * kCap];
-    for (int id : ids) {
-        std::string type = "?";
-        g_api.DeviceTypeName(id, type);
-        if (!ShowType(type)) continue;
-        Vec3 p, v;
-        if (!g_api.BarrelPosition(id, p) || !g_api.FireVelocity(id, v)) continue;
-        const float gravityMag = TypeGravity(id, team, type);
-        const bool beam = gravityMag == 0.0f;
-        const float gravityY = g_cal.gravitySign * gravityMag;
-        // Beams are drawn as a straight ray for one second of beam travel; shells until they fall well below the gun.
-        const int n = beam ? PredictTrajectory({p.x, p.y}, {v.x, v.y}, 0.0f, 0.0f, 0.05f, 1.0f, 1.0e9f, pts, kCap)
-                           : PredictTrajectory({p.x, p.y}, {v.x, v.y}, gravityY, DragFor(type), 0.08f, 10.0f, 1500.0f, pts, kCap);
-        int m = 0;
-        for (int i = 0; i < n; ++i) {
-            float x, y;
-            if (!WorldToPixels({pts[i].x, pts[i].y, p.z}, x, y)) continue;
-            line[2 * m] = x;
-            line[2 * m + 1] = y;
-            ++m;
-        }
-        if (beam) g_overlay.Line(line, m, 0.4f, 0.9f, 1.0f, 0.9f, 2.0f);
-        else g_overlay.Line(line, m, 1.0f, 0.85f, 0.1f, 0.9f, 2.0f);
-        if (g_state.impact) {
-            for (const EnemyDev& e : g_enemy)
-                if (DistanceToPolyline({e.pos.x, e.pos.y}, pts, n) < 70.0f) g_hitIds.insert(e.id);
-        }
-    }
-}
-
 void Ring(float cx, float cy, float radius, float r, float g, float b, float a, float width) {
     float pts[2 * 25];
     for (int i = 0; i <= 24; ++i) {
@@ -1066,6 +1515,155 @@ void Ring(float cx, float cy, float radius, float r, float g, float b, float a, 
         pts[2 * i + 1] = cy + std::sin(t) * radius;
     }
     g_overlay.Line(pts, 25, r, g, b, a, width);
+}
+
+void Cross(float cx, float cy, float half, float r, float g, float b, float a, float width) {
+    const float l1[4] = {cx - half, cy - half, cx + half, cy + half}, l2[4] = {cx - half, cy + half, cx + half, cy - half};
+    g_overlay.Line(l1, 2, r, g, b, a, width);
+    g_overlay.Line(l2, 2, r, g, b, a, width);
+}
+
+// A caption pill centred on (x, y), rendered once per distinct text and kept as a texture.
+void DrawLabel(const std::wstring& text, COLORREF accent, float x, float y) {
+    std::string key = "t:" + std::to_string(accent) + ":";
+    for (wchar_t c : text) key += c < 0x80 ? static_cast<char>(c) : '?';
+    auto it = g_labels.find(key);
+    if (it == g_labels.end()) {
+        if (g_labels.size() > 300) g_labels.clear();
+        HudImage img;
+        RenderLabel(text, accent, g_uiScale, img);
+        it = g_labels.emplace(key, std::move(img)).first;
+    }
+    g_overlay.Image(("lbl:" + key).c_str(), it->second.px.data(), it->second.w, it->second.h, false, x - static_cast<float>(it->second.w) / 2, y);
+}
+
+// Width (unscaled pixels) of a key / value panel that shows its longest value in full (Consolas 13 px is about 7.7 px per character).
+float PanelWidth(const std::vector<PanelLine>& lines) {
+    std::size_t longest = 0;
+    for (const PanelLine& l : lines) longest = std::max(longest, l.value.size());
+    return std::clamp(160.0f + 7.7f * static_cast<float>(longest), 300.0f, 700.0f);
+}
+
+// ---------------------------------------------------------------- terrain and water
+// Terrain is asked through the game's own CastGroundRay; water is a separate surface (GetWaterLevel(x): the shell is in the
+// water when its y is at least the level, deeper = larger y), so a shell over the sea ends on the surface, not on the sea bed.
+unsigned long long g_rayCalls = 0, g_rayTicks = 0;
+bool g_rayLogged1 = false, g_rayLogged2 = false;
+
+bool GroundSegment(Vec2f a, Vec2f b, Vec2f& hit) {
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+    bool touched = false;
+    Vec3 p;
+    const bool ok = g_api.GroundRay({a.x, a.y, 0.0f}, {b.x, b.y, 0.0f}, touched, p);
+    QueryPerformanceCounter(&t1);
+    g_rayTicks += static_cast<unsigned long long>(t1.QuadPart - t0.QuadPart);
+    ++g_rayCalls;
+    if ((!g_rayLogged1 && g_rayCalls >= 2000) || (!g_rayLogged2 && g_rayCalls >= 200000)) {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        Logf("terrain ray: %llu casts, %.2f us per cast", g_rayCalls,
+             1.0e6 * static_cast<double>(g_rayTicks) / static_cast<double>(f.QuadPart) / static_cast<double>(g_rayCalls));
+        if (g_rayCalls >= 200000) g_rayLogged2 = true;
+        else g_rayLogged1 = true;
+    }
+    if (!ok || !touched) return false;
+    hit = {p.x, p.y};
+    return true;
+}
+
+constexpr float kNoWater = 2.14748365e9f;  // what GetWaterLevel returns on a map without water
+float WaterAt(float x) {
+    float level = 0;
+    return g_api.WaterLevelAt(x, level) ? level : kNoWater;
+}
+float NoWaterAt(float) { return kNoWater; }
+
+constexpr int kTraceCap = 521;  // 20 s of physics frames + the start
+constexpr float kTraceMaxTime = 20.0f, kTraceGrace = 30.0f;
+constexpr int kTraceChord = 3;  // physics frames per terrain ray (TraceShot): the chord leaves the true path by at most 1.8 units
+
+// Shot traces of our own guns are cached: while a gun does not move, the same arc is asked every frame.
+struct CachedTrace {
+    float key[6] = {};
+    bool beam = false;
+    TraceResult res;
+    std::vector<Vec2f> pts;
+};
+std::vector<CachedTrace> g_traceCache;
+std::size_t g_traceNext = 0;
+
+const CachedTrace& TraceCached(Vec2f p, Vec2f v, float gravityY, float drag, bool beam) {
+    const float key[6] = {p.x, p.y, v.x, v.y, gravityY, drag};
+    for (const CachedTrace& c : g_traceCache)
+        if (c.beam == beam && std::memcmp(c.key, key, sizeof(key)) == 0) return c;
+    if (g_traceCache.capacity() < 160) g_traceCache.reserve(160);
+    CachedTrace* slot;
+    if (g_traceCache.size() < 160) {
+        g_traceCache.emplace_back();
+        slot = &g_traceCache.back();
+    } else {
+        slot = &g_traceCache[g_traceNext++ % g_traceCache.size()];
+    }
+    std::memcpy(slot->key, key, sizeof(key));
+    slot->beam = beam;
+    slot->pts.assign(kTraceCap, Vec2f{});
+    // Beams (gravity 0) are drawn for one second of beam travel and stop at terrain only; shells fly until terrain or water.
+    slot->res = beam ? TraceShot(p, v, 0.0f, 0.0f, 1.0f, kTraceGrace, kTraceChord, GroundSegment, NoWaterAt, slot->pts.data(), kTraceCap)
+                     : TraceShot(p, v, gravityY, drag, kTraceMaxTime, kTraceGrace, kTraceChord, GroundSegment, WaterAt, slot->pts.data(), kTraceCap);
+    slot->pts.resize(static_cast<std::size_t>(slot->res.n));
+    return *slot;
+}
+
+void DrawTrajectories(int team) {
+    std::vector<int> ids;
+    if (!g_api.OwnWeapons(team, ids) || ids.empty()) return;
+    float line[2 * kTraceCap];
+    int labels = 0;
+    const float s = g_uiScale;
+    for (int id : ids) {
+        std::string type = "?";
+        g_api.DeviceTypeName(id, type);
+        if (!ShowType(type)) continue;
+        Vec3 p, v;
+        if (!g_api.BarrelPosition(id, p) || !g_api.FireVelocity(id, v)) continue;
+        const float gravityMag = TypeGravity(id, team, type);
+        if (g_propelled.count(type)) continue;  // thrust-driven shells (missiles): the ballistic model does not describe them
+        const bool beam = gravityMag == 0.0f;
+        const float gravityY = g_cal.gravitySign * gravityMag;
+        const CachedTrace& tr = TraceCached({p.x, p.y}, {v.x, v.y}, gravityY, beam ? 0.0f : DragFor(type), beam);
+        const int n = tr.res.n;
+        int m = 0;
+        for (int i = 0; i < n; ++i) {
+            float x, y;
+            if (!WorldToPixels({tr.pts[static_cast<std::size_t>(i)].x, tr.pts[static_cast<std::size_t>(i)].y, p.z}, x, y)) continue;
+            line[2 * m] = x;
+            line[2 * m + 1] = y;
+            ++m;
+        }
+        if (beam) g_overlay.Line(line, m, 0.4f, 0.9f, 1.0f, 0.9f, 2.0f);
+        else g_overlay.Line(line, m, 1.0f, 0.85f, 0.1f, 0.9f, 2.0f);
+        // Landing point: yellow on terrain, blue on water. The flight time is written for the first few guns only.
+        if (tr.res.kind != ImpactKind::None) {
+            float x, y;
+            if (WorldToPixels({tr.res.point.x, tr.res.point.y, p.z}, x, y)) {
+                const bool water = tr.res.kind == ImpactKind::Water;
+                const float cr = water ? 0.35f : 1.0f, cg = water ? 0.72f : 0.85f, cb = water ? 1.0f : 0.1f;
+                Ring(x, y, 8.0f * s, cr, cg, cb, 1.0f, 2.5f);
+                Cross(x, y, 4.0f * s, cr, cg, cb, 1.0f, 2.0f);
+                if (!beam && labels < 3) {
+                    ++labels;
+                    wchar_t t[24];
+                    swprintf_s(t, L"%.1f s%s", tr.res.time, water ? L" (water)" : L"");
+                    DrawLabel(t, water ? aero::ui::kAccent : aero::ui::kWarn, x, y + 12.0f * s);
+                }
+            }
+        }
+        if (g_state.impact) {
+            for (const EnemyDev& e : g_enemy)
+                if (DistanceToPolyline({e.pos.x, e.pos.y}, tr.pts.data(), n) < 70.0f) g_hitIds.insert(e.id);
+        }
+    }
 }
 
 void DrawEnemies(int vw, int vh) {
@@ -1093,6 +1691,19 @@ void DrawEnemies(int vw, int vh) {
             g_overlay.Rect(x - half, y - half - 8 * s, 2 * half * ratio, 5 * s, ratio > 0.6f ? 0.2f : (ratio > 0.3f ? 0.98f : 0.97f),
                            ratio > 0.6f ? 0.83f : (ratio > 0.3f ? 0.75f : 0.35f), ratio > 0.6f ? 0.6f : 0.15f, 1.0f);
         }
+        if (g_state.timers && e.weapon && e.timerOk) {  // reload bar along the bottom edge of the box
+            const float by = y + half - 5.0f * s, bh = 4.0f * s;
+            g_overlay.Rect(x - half, by, 2 * half, bh, 0.05f, 0.06f, 0.08f, 0.85f);
+            if (e.ready) {
+                g_overlay.Rect(x - half, by, 2 * half, bh, 0.2f, 0.83f, 0.6f, 1.0f);
+            } else if (g_reloadSemantics != 0 && e.reloadPeriod > 0.05f) {
+                const float ratio = e.reloadValue / e.reloadPeriod;
+                const float frac = std::clamp(g_reloadSemantics == 1 ? 1.0f - ratio : ratio, 0.0f, 1.0f);
+                g_overlay.Rect(x - half, by, 2 * half * frac, bh, 0.38f, 0.65f, 0.98f, 1.0f);
+            } else {
+                g_overlay.Rect(x - half, by, 2 * half, bh, 0.98f, 0.75f, 0.14f, 0.6f);  // reloading, progress direction not learned yet
+            }
+        }
         if (!e.type.empty()) {
             auto it = g_labels.find(e.type);
             if (it == g_labels.end()) {
@@ -1112,16 +1723,870 @@ void DrawIntel(int vw) {
     if (g_intelImage.px.empty()) return;
     // Under the radar when it is on, otherwise in the radar's place.
     const float below = g_state.radar && !g_radarImage.px.empty() ? static_cast<float>(g_radarImage.h) + 12.0f * g_uiScale : 0.0f;
-    g_overlay.Image("intel", g_intelImage.px.data(), g_intelImage.w, g_intelImage.h, g_intelFresh,
-                    static_cast<float>(vw - g_intelImage.w) - 24.0f * g_uiScale, 100.0f * g_uiScale + below);
+    float x = 0, y = 0;
+    PlacePanel("intel", static_cast<float>(vw - g_intelImage.w) - 24.0f * g_uiScale, 100.0f * g_uiScale + below, g_intelImage.w, g_intelImage.h, x, y);
+    g_overlay.Image("intel", g_intelImage.px.data(), g_intelImage.w, g_intelImage.h, g_intelFresh, x, y);
     g_intelFresh = false;
 }
 
 void DrawRadar(int vw) {
     if (g_radarImage.px.empty()) return;
-    g_overlay.Image("radar", g_radarImage.px.data(), g_radarImage.w, g_radarImage.h, g_radarFresh,
-                    static_cast<float>(vw - g_radarImage.w) - 24.0f * g_uiScale, 100.0f * g_uiScale);
+    float x = 0, y = 0;
+    PlacePanel("radar", static_cast<float>(vw - g_radarImage.w) - 24.0f * g_uiScale, 100.0f * g_uiScale, g_radarImage.w, g_radarImage.h, x, y);
+    g_overlay.Image("radar", g_radarImage.px.data(), g_radarImage.w, g_radarImage.h, g_radarFresh, x, y);
     g_radarFresh = false;
+}
+
+// ---------------------------------------------------------------- incoming shells
+// Every enemy shell in the air is followed to its landing point (terrain or water); if that point is close to one of our
+// devices the shell is a threat. The radius is NOT calibrated against the real splash of each ammunition.
+constexpr float kThreatRadius = 90.0f;
+struct Threat {
+    Vec2f impact, device;
+    float eta = 0;
+    ImpactKind kind = ImpactKind::Ground;
+    int danger = 1;  // 1 any device, 2 a weapon, 3 the reactor
+    std::vector<Vec2f> arc;
+};
+std::vector<Threat> g_threats;
+struct ThreatTrack {
+    float vx = 0, vy = 0;
+    double t = 0;
+    float k = -1;           // exact drag measured on this very shell, -1 = not yet (no drag is assumed until then)
+    int good = 0, bad = 0;  // velocity pairs that follow / break the frame model (thrust, shields, collisions)
+};
+std::map<int, ThreatTrack> g_threatTracks;
+ULONGLONG g_lastBeep = 0;
+
+void UpdateThreats() {
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last < 100) return;
+    last = now;
+    g_threats.clear();
+    std::vector<Vec2f> ownPos;
+    ownPos.reserve(g_own.size());
+    for (const OwnDev& o : g_own) ownPos.push_back({o.pos.x, o.pos.y});
+    if (ownPos.empty()) return;
+    const double tnow = NowSeconds();
+    std::set<int> seen;
+    int processed = 0;
+    Vec2f pts[320];  // 12 s of physics frames
+    for (int code : g_enemyCodes) {
+        std::vector<int> ids;
+        if (!g_api.ProjectileIds(code, ids)) continue;
+        for (int id : ids) {
+            if (!seen.insert(id).second) continue;  // the game may list a side's shells under every team code of that side
+            if (++processed > 40) break;
+            Vec3 p, v;
+            float grav = 0;
+            if (!g_api.NodePos(id, p) || !g_api.NodeVel(id, v)) continue;
+            g_api.ProjectileGravity(id, grav);
+            ThreatTrack& tt = g_threatTracks[id];
+            const float gMag = std::fabs(grav);
+            const bool beam = gMag < 0.001f;
+            if (tt.t > 0 && !beam && (v.x != tt.vx || v.y != tt.vy)) {  // the velocity only changes on physics frames
+                const DragEstimate e = EstimateDragFrames(tt.vx, tt.vy, v.x, v.y, g_cal.gravitySign * gMag);
+                if (e.ok) {
+                    tt.k = e.k;
+                    ++tt.good;
+                } else {
+                    ++tt.bad;
+                }
+            }
+            tt.vx = v.x;
+            tt.vy = v.y;
+            tt.t = tnow;
+            if (tt.bad >= 3 && tt.bad > tt.good) continue;  // thrust-driven or deflected: the frame model does not describe it
+            const float drag = beam ? 0.0f : std::max(tt.k, 0.0f);
+            const TraceResult r = TraceShot({p.x, p.y}, {v.x, v.y}, g_cal.gravitySign * gMag, drag, 12.0f, 0.0f, 4, GroundSegment,
+                                            beam ? NoWaterAt : WaterAt, pts, 320);
+            if (r.kind == ImpactKind::None) continue;  // does not land within 12 s
+            float d = 0;
+            const int idx = NearestWithin(r.point, ownPos, kThreatRadius, d);
+            if (idx < 0) continue;
+            const OwnDev& o = g_own[static_cast<std::size_t>(idx)];
+            Threat th;
+            th.impact = r.point;
+            th.device = {o.pos.x, o.pos.y};
+            th.eta = r.time;
+            th.kind = r.kind;
+            th.danger = o.type == "reactor" ? 3 : (o.weapon ? 2 : 1);
+            th.arc.assign(pts, pts + r.n);
+            g_threats.push_back(std::move(th));
+        }
+    }
+    for (auto it = g_threatTracks.begin(); it != g_threatTracks.end();) it = seen.count(it->first) ? std::next(it) : g_threatTracks.erase(it);
+    std::sort(g_threats.begin(), g_threats.end(), [](const Threat& a, const Threat& b) {
+        if (a.danger != b.danger) return a.danger > b.danger;
+        return a.eta < b.eta;
+    });
+    if (g_threats.size() > 12) g_threats.resize(12);
+    if (!g_threats.empty() && g_threats[0].danger == 3 && g_threats[0].eta < 4.0f && now - g_lastBeep > 1500) {
+        g_lastBeep = now;
+        MessageBeep(MB_ICONEXCLAMATION);  // the reactor is about to be hit
+    }
+}
+
+void DrawThreats(int vw) {
+    const float s = g_uiScale;
+    float line[2 * 330];
+    for (const Threat& t : g_threats) {
+        const bool reactor = t.danger == 3, weapon = t.danger == 2;
+        const float cr = 1.0f, cg = reactor ? 0.25f : (weapon ? 0.55f : 0.85f), cb = reactor ? 0.25f : (weapon ? 0.15f : 0.2f);
+        int m = 0;
+        for (const Vec2f& q : t.arc) {
+            float x, y;
+            if (!WorldToPixels({q.x, q.y, 0.0f}, x, y)) continue;
+            line[2 * m] = x;
+            line[2 * m + 1] = y;
+            if (++m >= 330) break;
+        }
+        g_overlay.Line(line, m, cr, cg, cb, 0.55f, 1.5f);
+        float ix, iy;
+        if (WorldToPixels({t.impact.x, t.impact.y, 0.0f}, ix, iy)) {
+            float radius = 18.0f * s, ex, ey;
+            if (WorldToPixels({t.impact.x + kThreatRadius, t.impact.y, 0.0f}, ex, ey)) radius = std::max(8.0f * s, std::fabs(ex - ix));
+            Ring(ix, iy, radius, cr, cg, cb, 0.9f, 2.5f);
+            Cross(ix, iy, 6.0f * s, cr, cg, cb, 1.0f, 2.5f);
+            wchar_t txt[24];
+            swprintf_s(txt, L"%.1f s", t.eta);
+            DrawLabel(txt, reactor ? aero::ui::kBad : aero::ui::kWarn, ix, iy - radius - 22.0f * s);
+        }
+        float dx, dy;
+        if (WorldToPixels({t.device.x, t.device.y, 0.0f}, dx, dy)) Ring(dx, dy, 16.0f * s, cr, cg, cb, 1.0f, 3.0f);
+    }
+    if (g_threats.empty()) return;
+    const Threat& first = g_threats[0];
+    wchar_t banner[64];
+    swprintf_s(banner, L"%s  %.1f s  (%zu incoming)", first.danger == 3 ? L"REACTOR UNDER FIRE" : (first.danger == 2 ? L"GUN UNDER FIRE" : L"INCOMING"),
+               first.eta, g_threats.size());
+    DrawLabel(banner, first.danger == 3 ? aero::ui::kBad : aero::ui::kWarn, static_cast<float>(vw) / 2.0f, 70.0f * s);
+}
+
+// ---------------------------------------------------------------- aim calculator
+// For the enemy device chosen in the Enemy tab: the elevation each shown weapon type needs (flat arc and lob), whether the arc is
+// free of terrain and water on the way, and the arc itself. Speed, gravity and drag are the ones used for the trajectory overlay.
+struct AimLine {
+    std::string type;
+    bool nowOk = false;
+    float nowDeg = 0;
+    int n = 0;
+    AimSolution sol[2];
+};
+std::vector<AimLine> g_aimLines;
+std::vector<Vec2f> g_aimGhost;
+HudImage g_aimImage;
+std::wstring g_aimSig;
+bool g_aimFresh = false;
+constexpr double kDegToRad = 0.017453292519943295;
+
+void UpdateAimCalc(int team) {
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last < 120) return;
+    last = now;
+    g_aimLines.clear();
+    g_aimGhost.clear();
+    std::vector<int> ids;
+    if (!g_api.OwnWeapons(team, ids)) return;
+    // The gun the player has selected (clicked) is the one the angle is computed for; with no gun selected every shown type is listed.
+    int selected = 0;
+    const bool gunMode = g_api.SelectedDevice(selected) && selected > 0 && std::find(ids.begin(), ids.end(), selected) != ids.end();
+    if (gunMode) ids.assign(1, selected);
+    Vec3 tpos;
+    if (g_state.aimTarget == 0 || !g_api.DevicePosition(g_state.aimTarget, tpos)) {
+        std::vector<PanelLine> hint;
+        hint.push_back({Tr(L"Target", L"Цель"), Tr(L"not chosen", L"не выбрана"), aero::ui::kWarn});
+        hint.push_back({Tr(L"How", L"Как"), (std::wstring(Tr(L"point at an enemy gun and press ", L"наведите мышь на вражеское орудие и нажмите ")) + BindLabel(kItemPickTarget)).c_str(), 0});
+        hint.push_back({Tr(L"Gun", L"Орудие"), gunMode ? Tr(L"the selected one", L"выбранное вами") : Tr(L"select a gun first", L"сначала выберите орудие"), 0});
+        std::wstring sig;
+        for (const PanelLine& pl : hint) sig += pl.key + L"|" + pl.value + L";";
+        if (sig != g_aimSig) {
+            g_aimSig = sig;
+            RenderPanel(Tr(L"Aim calculator", L"Калькулятор прицела"), hint, g_uiScale, g_aimImage, PanelWidth(hint));
+            g_aimFresh = true;
+        }
+        return;
+    }
+    std::set<std::string> done;
+    for (int id : ids) {
+        std::string type;
+        if (!g_api.DeviceTypeName(id, type) || (!gunMode && !ShowType(type)) || !done.insert(type).second) continue;
+        Vec3 p, v;
+        if (!g_api.BarrelPosition(id, p) || !g_api.FireVelocity(id, v)) continue;
+        const float gMag = TypeGravity(id, team, type);
+        if (gMag == 0.0f || g_propelled.count(type)) continue;  // beams fly straight, missiles are thrust-driven: nothing to solve
+        const float gY = g_cal.gravitySign * gMag, drag = DragFor(type);
+        const float speed = std::sqrt(v.x * v.x + v.y * v.y);
+        const float dirX = tpos.x >= p.x ? 1.0f : -1.0f;
+        AimLine L;
+        L.type = type;
+        L.nowOk = v.x * dirX > 0.0f;
+        L.nowDeg = ElevationDeg({v.x, v.y}, gY);
+        const double up = gY >= 0.0f ? -1.0 : 1.0;
+        auto velocityFor = [&](double e) {
+            return Vec2f{static_cast<float>(dirX * speed * std::cos(e)), static_cast<float>(up * speed * std::sin(e))};
+        };
+        auto clear = [&](double e, double t) {
+            Vec2f buf[kTraceCap];
+            const TraceResult r = TraceShot({p.x, p.y}, velocityFor(e), gY, drag, std::max(0.2f, static_cast<float>(t) - 0.1f), kTraceGrace, kTraceChord,
+                                            GroundSegment, WaterAt, buf, kTraceCap);
+            return r.kind == ImpactKind::None;
+        };
+        L.n = SolveAim({p.x, p.y}, speed, gY, drag, {tpos.x, tpos.y}, clear, L.sol);
+        if (g_aimGhost.empty() && L.n > 0) {  // the arc of the first weapon type, preferring a free one
+            const AimSolution* best = &L.sol[0];
+            for (int i = 0; i < L.n; ++i)
+                if (L.sol[i].clear) {
+                    best = &L.sol[i];
+                    break;
+                }
+            Vec2f buf[kTraceCap];
+            const TraceResult r = TraceShot({p.x, p.y}, velocityFor(best->elevationDeg * kDegToRad), gY, drag, best->time + 0.15f, kTraceGrace, kTraceChord,
+                                            GroundSegment, WaterAt, buf, kTraceCap);
+            g_aimGhost.assign(buf, buf + r.n);
+        }
+        g_aimLines.push_back(std::move(L));
+        if (g_aimLines.size() >= 4) break;
+    }
+
+    std::vector<PanelLine> lines;
+    wchar_t b[96];
+    {
+        const std::string& tt = TypeOf(g_state.aimTarget);
+        swprintf_s(b, L"%s #%d", std::wstring(tt.begin(), tt.end()).c_str(), g_state.aimTarget);
+        lines.push_back({Tr(L"Target", L"Цель"), b, 0});
+    }
+    if (gunMode) {
+        const std::wstring selName(L"#" + std::to_wstring(selected));
+        lines.push_back({Tr(L"Selected gun", L"Выбранное орудие"), selName, 0});
+    } else {
+        lines.push_back({Tr(L"Tip", L"Совет"), Tr(L"select a gun to see only its angle", L"выберите орудие, чтобы видеть только его угол"), 0});
+    }
+    if (g_aimLines.empty()) lines.push_back({Tr(L"Guns", L"Орудия"), Tr(L"no arc weapons", L"нет орудий с дугой"), 0});
+    const wchar_t* blocked = Tr(L"  blocked", L"  мешает рельеф");
+    for (const AimLine& L : g_aimLines) {
+        const std::wstring name(L.type.begin(), L.type.end());
+        if (L.n == 0) {
+            lines.push_back({name, Tr(L"out of range", L"вне дальности"), aero::ui::kBad});
+            continue;
+        }
+        for (int i = 0; i < L.n; ++i) {
+            if (i == 0) {
+                if (L.nowOk) swprintf_s(b, L"%.1f° (%s %.1f°)%s", L.sol[i].elevationDeg, Tr(L"now", L"сейчас"), L.nowDeg, L.sol[i].clear ? L"" : blocked);
+                else swprintf_s(b, L"%.1f° (%s)%s", L.sol[i].elevationDeg, Tr(L"aim the other way", L"развернитесь"), L.sol[i].clear ? L"" : blocked);
+                lines.push_back({name, b, L.sol[i].clear ? 0 : aero::ui::kBad});
+            } else {
+                swprintf_s(b, L"%.1f°  %.1f s%s", L.sol[i].elevationDeg, L.sol[i].time, L.sol[i].clear ? L"" : blocked);
+                lines.push_back({Tr(L"  lob", L"  навесом"), b, L.sol[i].clear ? 0 : aero::ui::kBad});
+            }
+        }
+    }
+    std::wstring sig;
+    for (const PanelLine& pl : lines) sig += pl.key + L"|" + pl.value + L";";
+    if (sig != g_aimSig) {
+        g_aimSig = sig;
+        RenderPanel(Tr(L"Aim calculator", L"Калькулятор прицела"), lines, g_uiScale, g_aimImage, PanelWidth(lines));
+        g_aimFresh = true;
+    }
+}
+
+void DrawAimGhost() {
+    if (g_aimGhost.size() < 2) return;
+    float line[2 * kTraceCap];
+    int m = 0;
+    for (const Vec2f& q : g_aimGhost) {
+        float x, y;
+        if (!WorldToPixels({q.x, q.y, 0.0f}, x, y)) continue;
+        line[2 * m] = x;
+        line[2 * m + 1] = y;
+        if (++m >= kTraceCap) break;
+    }
+    g_overlay.Line(line, m, 0.35f, 0.95f, 0.5f, 0.95f, 2.5f);
+}
+
+// ---------------------------------------------------------------- weak links of a base
+// The nodes a base is anchored by (the terrain block recorded in each node), and the links between them, form a support graph.
+// A link whose loss leaves a piece with no path to the ground is a weak link; the weight of what hangs on it is estimated from
+// the devices sitting on it (reactor 1000, weapon 120, anything else 10: priorities, not measured values).
+struct WeakDraw {
+    Vec2f a, b;
+    double value = 0;
+    int links = 0;
+    std::wstring what;
+};
+std::vector<WeakDraw> g_weakEnemy, g_weakOwn;
+std::wstring g_weakNoteEnemy, g_weakNoteOwn;
+HudImage g_weakImage;
+std::wstring g_weakSig;
+bool g_weakFresh = false;
+
+struct BaseDev {
+    Vec2f pos;
+    std::string type;
+    bool weapon = false;
+};
+
+double DeviceWeight(const std::string& type, bool weapon) { return type == "reactor" ? 1000.0 : (weapon ? 120.0 : 10.0); }
+
+std::wstring Describe(int reactors, int guns, int others) {
+    std::wstring s;
+    auto add = [&](const std::wstring& part) { s += (s.empty() ? L"" : L" + ") + part; };
+    if (reactors) add(L"reactor");
+    if (guns) add(std::to_wstring(guns) + (guns == 1 ? L" gun" : L" guns"));
+    if (others) add(std::to_wstring(others) + (others == 1 ? L" device" : L" devices"));
+    return s.empty() ? std::wstring(L"structure only") : s;
+}
+
+void AnalyseBase(int code, const std::vector<BaseDev>& devs, std::vector<WeakDraw>& out, std::wstring& note) {
+    out.clear();
+    note.clear();
+    BaseGraph graph;
+    if (code == 0 || !g_api.BaseGraphOf(code, graph)) {
+        note = L"base not readable";
+        return;
+    }
+    const int n = static_cast<int>(graph.nodes.size());
+    std::vector<char> anchored(static_cast<std::size_t>(n), 0);
+    int anchoredCount = 0;
+    for (int i = 0; i < n; ++i) {
+        anchored[static_cast<std::size_t>(i)] = graph.nodes[static_cast<std::size_t>(i)].anchored ? 1 : 0;
+        anchoredCount += anchored[static_cast<std::size_t>(i)];
+    }
+    if (anchoredCount == 0) {
+        note = L"no ground-anchored nodes found";  // the anchor field of the nodes is an unverified assumption
+        return;
+    }
+    std::vector<std::pair<int, int>> edges;
+    edges.reserve(graph.edges.size());
+    for (const GraphEdge& e : graph.edges) edges.push_back({e.a, e.b});
+    std::vector<double> weight(edges.size(), 0.0);
+    std::vector<int> attach(devs.size(), -1);
+    for (std::size_t i = 0; i < devs.size(); ++i) {  // a device hangs on the nearest link (within 60 units)
+        float best = 60.0f;
+        int bi = -1;
+        for (std::size_t j = 0; j < edges.size(); ++j) {
+            const GraphNode& na = graph.nodes[static_cast<std::size_t>(edges[j].first)];
+            const GraphNode& nb = graph.nodes[static_cast<std::size_t>(edges[j].second)];
+            const float d = DistanceToSegment(devs[i].pos, {na.x, na.y}, {nb.x, nb.y});
+            if (d < best) {
+                best = d;
+                bi = static_cast<int>(j);
+            }
+        }
+        attach[i] = bi;
+        if (bi >= 0) weight[static_cast<std::size_t>(bi)] += DeviceWeight(devs[i].type, devs[i].weapon);
+    }
+    for (const WeakLink& w : FindWeakLinks(n, anchored, edges, weight, 5)) {
+        const std::vector<char> lost = LostLinks(n, anchored, edges, w.edge);
+        int reactors = 0, guns = 0, others = 0;
+        for (std::size_t i = 0; i < devs.size(); ++i) {
+            if (attach[i] < 0 || !lost[static_cast<std::size_t>(attach[i])]) continue;
+            if (devs[i].type == "reactor") ++reactors;
+            else if (devs[i].weapon) ++guns;
+            else ++others;
+        }
+        const GraphEdge& e = graph.edges[static_cast<std::size_t>(w.edge)];
+        WeakDraw d;
+        d.a = {graph.nodes[static_cast<std::size_t>(e.a)].x, graph.nodes[static_cast<std::size_t>(e.a)].y};
+        d.b = {graph.nodes[static_cast<std::size_t>(e.b)].x, graph.nodes[static_cast<std::size_t>(e.b)].y};
+        d.value = w.value;
+        d.links = w.links;
+        d.what = Describe(reactors, guns, others) + L", " + std::to_wstring(w.links) + (w.links == 1 ? L" link" : L" links");
+        out.push_back(std::move(d));
+    }
+    if (out.empty()) note = L"no single link cuts anything";
+}
+
+void UpdateWeak(int team) {
+    static ULONGLONG last = 0;
+    const ULONGLONG now = GetTickCount64();
+    if (now - last < 1500) return;
+    last = now;
+    if (g_state.weakEnemy) {
+        std::vector<BaseDev> devs;
+        for (const EnemyDev& e : g_enemy) devs.push_back({{e.pos.x, e.pos.y}, e.type, e.weapon});
+        AnalyseBase(g_enemyTeam, devs, g_weakEnemy, g_weakNoteEnemy);
+    } else {
+        g_weakEnemy.clear();
+        g_weakNoteEnemy.clear();
+    }
+    if (g_state.weakOwn) {
+        std::vector<BaseDev> devs;
+        for (const OwnDev& o : g_own) devs.push_back({{o.pos.x, o.pos.y}, o.type, o.weapon});
+        AnalyseBase(team, devs, g_weakOwn, g_weakNoteOwn);
+    } else {
+        g_weakOwn.clear();
+        g_weakNoteOwn.clear();
+    }
+    std::vector<PanelLine> lines;
+    auto section = [&](const wchar_t* who, const std::vector<WeakDraw>& list, const std::wstring& note) {
+        for (std::size_t i = 0; i < list.size(); ++i) lines.push_back({std::wstring(who) + L" #" + std::to_wstring(i + 1), list[i].what, i == 0 ? aero::ui::kWarn : 0});
+        if (list.empty() && !note.empty()) lines.push_back({who, note, 0});
+    };
+    if (g_state.weakEnemy) section(L"Enemy", g_weakEnemy, g_weakNoteEnemy);
+    if (g_state.weakOwn) section(L"Yours", g_weakOwn, g_weakNoteOwn);
+    std::wstring sig;
+    for (const PanelLine& pl : lines) sig += pl.key + L"|" + pl.value + L";";
+    if (lines.empty()) {
+        g_weakImage = HudImage{};
+        g_weakSig.clear();
+    } else if (sig != g_weakSig) {
+        g_weakSig = sig;
+        RenderPanel(L"Weak links", lines, g_uiScale, g_weakImage, PanelWidth(lines));
+        g_weakFresh = true;
+    }
+}
+
+void DrawWeak() {
+    const float s = g_uiScale;
+    auto draw = [&](const std::vector<WeakDraw>& list, float r, float g, float b) {
+        for (std::size_t i = 0; i < list.size(); ++i) {
+            float x1, y1, x2, y2;
+            if (!WorldToPixels({list[i].a.x, list[i].a.y, 0.0f}, x1, y1) || !WorldToPixels({list[i].b.x, list[i].b.y, 0.0f}, x2, y2)) continue;
+            const float seg[4] = {x1, y1, x2, y2};
+            g_overlay.Line(seg, 2, r, g, b, i == 0 ? 1.0f : 0.8f, i == 0 ? 6.0f : 4.0f);
+            DrawLabel(L"#" + std::to_wstring(i + 1), aero::ui::kWarn, (x1 + x2) / 2.0f, (y1 + y2) / 2.0f - 26.0f * s);
+        }
+    };
+    if (g_state.weakEnemy) draw(g_weakEnemy, 1.0f, 0.2f, 0.85f);
+    if (g_state.weakOwn) draw(g_weakOwn, 0.2f, 0.85f, 1.0f);
+}
+
+// ---------------------------------------------------------------- battle statistics (estimates)
+// Shots are counted from our own projectiles appearing in the air; a shot is a "hit" when its last known point was within 90 units
+// of an enemy device. Damage is the loss of hit points of devices between two refreshes (the game offers no damage counter),
+// so repairs, rebuilt devices and damage by teammates are not told apart.
+struct Stats {
+    bool active = false;
+    double start = 0;
+    int shots = 0, hits = 0, misses = 0;
+    double dealt = 0, taken = 0;
+    int enemyLost = 0, ownLost = 0;
+};
+Stats g_stats;
+struct ShotTrack {
+    Vec2f pos, vel;
+};
+std::map<int, ShotTrack> g_shots;
+std::map<int, float> g_hpEnemy, g_hpOwn;
+HudImage g_statsImage;
+std::wstring g_statsSig;
+bool g_statsFresh = false;
+
+void ResetStats() {
+    g_stats = Stats{};
+    g_stats.active = true;
+    g_stats.start = NowSeconds();
+    g_shots.clear();
+    g_hpEnemy.clear();
+    g_hpOwn.clear();
+    g_statsSig.clear();
+}
+
+void TrackShots(int team) {
+    std::vector<int> ids;
+    if (!g_api.ProjectileIds(team, ids)) return;
+    std::vector<Vec2f> enemyPos;
+    enemyPos.reserve(g_enemy.size());
+    for (const EnemyDev& e : g_enemy) enemyPos.push_back({e.pos.x, e.pos.y});
+    std::set<int> alive;
+    for (int id : ids) {
+        Vec3 p, v;
+        if (!g_api.NodePos(id, p) || !g_api.NodeVel(id, v)) continue;
+        alive.insert(id);
+        const auto it = g_shots.find(id);
+        if (it == g_shots.end()) ++g_stats.shots;
+        g_shots[id] = {{p.x, p.y}, {v.x, v.y}};
+    }
+    for (auto it = g_shots.begin(); it != g_shots.end();) {
+        if (alive.count(it->first)) {
+            ++it;
+            continue;
+        }
+        const Vec2f end{it->second.pos.x + it->second.vel.x * 0.016f, it->second.pos.y + it->second.vel.y * 0.016f};  // about one frame further
+        float d = 0;
+        if (NearestWithin(end, enemyPos, 90.0f, d) >= 0) ++g_stats.hits;
+        else ++g_stats.misses;
+        it = g_shots.erase(it);
+    }
+}
+
+void UpdateDamage() {
+    if (!g_worldFresh) return;
+    g_worldFresh = false;
+    std::map<int, float> curEnemy, curOwn;
+    for (const EnemyDev& e : g_enemy) {
+        float hp = 0, maxHp = 0;
+        if (!g_api.DeviceHealth(e.id, hp, maxHp)) continue;
+        curEnemy[e.id] = hp;
+        const auto it = g_hpEnemy.find(e.id);
+        if (it != g_hpEnemy.end() && hp < it->second) g_stats.dealt += it->second - hp;
+    }
+    for (const OwnDev& o : g_own) {
+        float hp = 0, maxHp = 0;
+        if (!g_api.DeviceHealth(o.id, hp, maxHp)) continue;
+        curOwn[o.id] = hp;
+        const auto it = g_hpOwn.find(o.id);
+        if (it != g_hpOwn.end() && hp < it->second) g_stats.taken += it->second - hp;
+    }
+    if (!g_hpEnemy.empty() && !curEnemy.empty())
+        for (const auto& [id, hp] : g_hpEnemy)
+            if (!curEnemy.count(id) && hp > 0.0f) ++g_stats.enemyLost;
+    if (!g_hpOwn.empty() && !curOwn.empty())
+        for (const auto& [id, hp] : g_hpOwn)
+            if (!curOwn.count(id) && hp > 0.0f) ++g_stats.ownLost;
+    g_hpEnemy.swap(curEnemy);
+    g_hpOwn.swap(curOwn);
+}
+
+void RefreshStatsPanel() {
+    if (!g_stats.active) return;
+    const int secs = static_cast<int>(NowSeconds() - g_stats.start);
+    wchar_t b[64];
+    std::vector<PanelLine> lines;
+    swprintf_s(b, L"%d:%02d", secs / 60, secs % 60);
+    lines.push_back({L"Time", b, 0});
+    lines.push_back({L"Shots fired", std::to_wstring(g_stats.shots), 0});
+    const int done = g_stats.hits + g_stats.misses;
+    if (done > 0) swprintf_s(b, L"%d  (%.0f%%)", g_stats.hits, 100.0 * g_stats.hits / done);
+    else swprintf_s(b, L"-");
+    lines.push_back({L"Hits (est.)", b, 0});
+    swprintf_s(b, L"%.0f", g_stats.dealt);
+    lines.push_back({L"Damage dealt (HP)", b, 0});
+    swprintf_s(b, L"%.0f", g_stats.taken);
+    lines.push_back({L"Damage taken (HP)", b, g_stats.taken > g_stats.dealt ? aero::ui::kBad : 0});
+    lines.push_back({L"Enemy devices lost", std::to_wstring(g_stats.enemyLost), 0});
+    lines.push_back({L"Your devices lost", std::to_wstring(g_stats.ownLost), 0});
+    std::wstring sig;
+    for (const PanelLine& pl : lines) sig += pl.key + L"|" + pl.value + L";";
+    if (sig != g_statsSig) {
+        g_statsSig = sig;
+        RenderPanel(L"Battle stats (estimates)", lines, g_uiScale, g_statsImage, PanelWidth(lines));
+        g_statsFresh = true;
+    }
+}
+
+std::wstring StatsPath() {
+    std::wstring p = IniPath();
+    const std::size_t slash = p.find_last_of(L'\\');
+    return slash == std::wstring::npos ? p : p.substr(0, slash + 1) + L"FortsStats.csv";
+}
+
+// Appends one line per match to FortsStats.csv next to the module.
+void ExportStats() {
+    if (!g_stats.active || (g_stats.shots == 0 && g_stats.dealt == 0 && g_stats.taken == 0)) {
+        g_stats.active = false;
+        return;
+    }
+    g_stats.active = false;
+    const std::wstring path = StatsPath();
+    FILE* f = nullptr;
+    if (path.empty() || _wfopen_s(&f, path.c_str(), L"ab") != 0 || !f) return;
+    std::fseek(f, 0, SEEK_END);
+    if (std::ftell(f) == 0) std::fputs("time,duration_s,shots,hits_est,misses_est,damage_dealt_hp,damage_taken_hp,enemy_devices_lost,own_devices_lost\r\n", f);
+    char stamp[32] = "";
+    std::time_t t = std::time(nullptr);
+    std::tm tmv{};
+    localtime_s(&tmv, &t);
+    std::strftime(stamp, sizeof(stamp), "%Y-%m-%d %H:%M:%S", &tmv);
+    std::fprintf(f, "%s,%.0f,%d,%d,%d,%.0f,%.0f,%d,%d\r\n", stamp, NowSeconds() - g_stats.start, g_stats.shots, g_stats.hits, g_stats.misses, g_stats.dealt,
+                 g_stats.taken, g_stats.enemyLost, g_stats.ownLost);
+    std::fclose(f);
+    Logf("stats exported: %d shots, %d hits (est.), damage dealt %.0f, taken %.0f", g_stats.shots, g_stats.hits, g_stats.dealt, g_stats.taken);
+}
+
+// The panels stack in the left column.
+void DrawLeftPanels() {
+    const float s = g_uiScale;
+    float y = 100.0f * s;
+    const float x = 24.0f * s;
+    auto put = [&](const char* key, HudImage& img, bool& fresh) {
+        if (img.px.empty()) return;
+        float ox = 0, oy = 0;
+        PlacePanel(key, x, y, img.w, img.h, ox, oy);
+        g_overlay.Image(key, img.px.data(), img.w, img.h, fresh, ox, oy);
+        fresh = false;
+        y += static_cast<float>(img.h) + 10.0f * s;
+    };
+    if (g_state.aimCalc) put("aimcalc", g_aimImage, g_aimFresh);
+    if (g_state.weakEnemy || g_state.weakOwn) put("weak", g_weakImage, g_weakFresh);
+    if (g_state.stats) put("stats", g_statsImage, g_statsFresh);
+}
+
+// ---------------------------------------------------------------- self-test
+// Passive: it never fires, aims or changes anything. Once per match it logs what the game calls return (water, terrain ray cost,
+// selected device, base graph anchors, weapon timers). For every shell that appears (ours, the AI's, other players') it predicts the
+// path from the second observation on, and when the shell disappears it logs how far its last seen point was from that path and
+// how much of the path was still left (a shell is last seen up to one physics frame, |v|*0.04, before it hits).
+struct EvalShell {
+    float vx = 0, vy = 0, k = -1;
+    int good = 0, bad = 0, samples = 0, code = 0;
+    bool predicted = false;
+    std::vector<Vec2f> pts;
+    ImpactKind kind = ImpactKind::None;
+    float eta = 0;
+    Vec2f first{}, last{}, lastVel{};
+    double firstT = 0, lastT = 0, sumPath = 0, maxPath = 0;
+    int pathN = 0;
+    float grav = 0;
+};
+std::map<int, EvalShell> g_eval;
+struct EvalSummary {
+    int shells = 0, followed = 0, unmodelled = 0, noPrediction = 0;
+    double sumPath = 0, worstPath = 0, sumRemain = 0;
+    int landedWithinFrame = 0;
+} g_evalSum;
+int g_selfTestTeam = -1, g_selfTestTicks = 0, g_selfTestEnvAt = 0;  // EnvAt: 0 = not run yet, >0 = tick of the first run, -1 = both runs done
+
+float PathDistance(const std::vector<Vec2f>& pts, Vec2f p, std::size_t* segment = nullptr) {
+    float best = 1.0e30f;
+    for (std::size_t i = 0; i + 1 < pts.size(); ++i) {
+        const float d = DistanceToSegment(p, pts[i], pts[i + 1]);
+        if (d < best) {
+            best = d;
+            if (segment) *segment = i;
+        }
+    }
+    return best;
+}
+
+// Length of the predicted path that lies after the projection of p on it.
+float PathRemaining(const std::vector<Vec2f>& pts, Vec2f p, std::size_t seg) {
+    if (seg + 1 >= pts.size()) return 0.0f;
+    const Vec2f a = pts[seg], b = pts[seg + 1];
+    const double dx = b.x - a.x, dy = b.y - a.y, len2 = dx * dx + dy * dy;
+    const double t = len2 > 0 ? std::clamp(((p.x - a.x) * dx + (p.y - a.y) * dy) / len2, 0.0, 1.0) : 1.0;
+    double rest = (1.0 - t) * std::sqrt(len2);
+    for (std::size_t i = seg + 1; i + 1 < pts.size(); ++i) rest += detail::Dist(pts[i], pts[i + 1]);
+    return static_cast<float>(rest);
+}
+
+void SelfTestEnvironment(int team) {
+    Logf("selftest: ===== environment (team %d, online=%d) =====", team, g_online ? 1 : 0);
+    Vec3 cam{};
+    const bool haveCam = g_api.CameraFocus(cam);
+    if (haveCam) {
+        float level = 0;
+        const bool ok = g_api.WaterLevelAt(cam.x, level);
+        Logf("selftest: camera focus (%.0f, %.0f); water level at its x: %s%.1f%s", cam.x, cam.y, ok ? "" : "call failed ", ok ? level : 0.0f,
+             ok && level > 1.0e9f ? " (= no water on this map)" : "");
+        Vec3 scr{}, back{}, mouseScr{}, mouseWorld{};
+        const Vec3 probe{cam.x + 700.0f, cam.y - 300.0f, cam.z};
+        if (g_api.ToScreen(probe, scr) && g_api.ScreenToWorldPoint(scr, back))
+            Logf("selftest: WorldToScreen -> ScreenToWorld round trip: world (%.1f, %.1f) -> screen (%.4f, %.4f) -> world (%.1f, %.1f)", probe.x, probe.y,
+                 scr.x, scr.y, back.x, back.y);
+        else
+            Logf("selftest: WorldToScreen/ScreenToWorld round trip failed");
+        if (g_api.MouseWorld(mouseScr, mouseWorld))
+            Logf("selftest: mouse screen (%.4f, %.4f) -> world (%.1f, %.1f)", mouseScr.x, mouseScr.y, mouseWorld.x, mouseWorld.y);
+        else
+            Logf("selftest: GetMousePos failed");
+        // Cost and sanity of the terrain ray: 300 horizontal 400-unit segments spread around the camera height.
+        LARGE_INTEGER f, t0, t1;
+        QueryPerformanceFrequency(&f);
+        int hits = 0, fails = 0;
+        QueryPerformanceCounter(&t0);
+        for (int i = 0; i < 300; ++i) {
+            bool hit = false;
+            Vec3 p;
+            const float y = cam.y - 1500.0f + 10.0f * static_cast<float>(i);
+            if (!g_api.GroundRay({cam.x - 200.0f, y, 0.0f}, {cam.x + 200.0f, y, 0.0f}, hit, p)) ++fails;
+            else if (hit) ++hits;
+        }
+        QueryPerformanceCounter(&t1);
+        Logf("selftest: terrain ray: 300 casts, %d hit terrain, %d failed, %.2f us per cast", hits, fails,
+             1.0e6 * static_cast<double>(t1.QuadPart - t0.QuadPart) / static_cast<double>(f.QuadPart) / 300.0);
+    } else {
+        Logf("selftest: camera focus not readable");
+    }
+    int selected = -2;
+    if (g_api.SelectedDevice(selected)) {
+        std::string type = "?";
+        g_api.DeviceTypeName(selected, type);
+        Logf("selftest: GetLocalSelectedDeviceId = %d (type %s)", selected, type.c_str());
+    } else {
+        Logf("selftest: GetLocalSelectedDeviceId faulted");
+    }
+    std::string types;
+    for (const auto& [name, n] : g_typeCount) types += name + " x" + std::to_string(n) + "  ";
+    Logf("selftest: own weapon types: %s", types.empty() ? "(none)" : types.c_str());
+    Logf("selftest: own devices %zu, enemy devices %zu, enemy team codes %zu", g_own.size(), g_enemy.size(), g_enemyCodes.size());
+    int shown = 0;
+    for (const OwnDev& o : g_own) {
+        if (!o.weapon || shown >= 4) continue;
+        ++shown;
+        bool ready = false;
+        float value = 0, period = 0;
+        const bool okR = g_api.WeaponReady(o.id, ready), okT = g_api.WeaponReload(o.id, value, period);
+        Logf("selftest: own weapon id=%d type=%s ready=%d(%d) reload value=%.3f period=%.3f(%d)", o.id, o.type.c_str(), ready ? 1 : 0, okR ? 1 : 0, value,
+             period, okT ? 1 : 0);
+    }
+    auto graph = [&](const char* name, int code) {
+        BaseGraph bg;
+        if (!g_api.BaseGraphOf(code, bg)) {
+            Logf("selftest: base graph of %s (code %d): not readable or empty", name, code);
+            return;
+        }
+        std::map<int, int> values;
+        int anchored = 0;
+        for (const GraphNode& n : bg.nodes) {
+            ++values[n.ground];
+            if (n.anchored) ++anchored;
+        }
+        std::string dist;
+        int shownValues = 0;
+        for (const auto& [value, n] : values) {
+            if (++shownValues > 6) break;
+            dist += std::to_string(value) + ":" + std::to_string(n) + " ";
+        }
+        Logf("selftest: base graph of %s (code %d): %zu nodes, %zu links, %d anchored; node+0x18 values (value:count) %s", name, code, bg.nodes.size(),
+             bg.edges.size(), anchored, dist.c_str());
+    };
+    graph("own base", team);
+    for (int code : g_enemyCodes) graph("enemy base", code);
+    Logf("selftest: ===== end of environment =====");
+}
+
+void SelfTestFinish(int id, EvalShell& e) {
+    ++g_evalSum.shells;
+    if (e.samples < 3 || !e.predicted) {
+        ++g_evalSum.noPrediction;
+        return;
+    }
+    if (e.bad >= 3 && e.bad > e.good) {
+        ++g_evalSum.unmodelled;
+        return;
+    }
+    std::size_t seg = 0;
+    PathDistance(e.pts, e.last, &seg);
+    const float remaining = PathRemaining(e.pts, e.last, seg);
+    const float frameStep = std::sqrt(e.lastVel.x * e.lastVel.x + e.lastVel.y * e.lastVel.y) * static_cast<float>(kSimFrame);
+    const bool within = remaining <= frameStep * 1.5f + 5.0f;
+    ++g_evalSum.followed;
+    g_evalSum.sumPath += e.sumPath / std::max(1, e.pathN);
+    g_evalSum.worstPath = std::max(g_evalSum.worstPath, e.maxPath);
+    g_evalSum.sumRemain += remaining;
+    if (within) ++g_evalSum.landedWithinFrame;
+    Logf("selftest: shell id=%d code=%d flight=%.2fs k=%.4f predicted %s at (%.0f, %.0f) after %.2fs; last seen (%.0f, %.0f); off path: mean %.2f max %.2f; path left %.1f (frame step %.1f) -> %s",
+         id, e.code, e.lastT - e.firstT, e.k, e.kind == ImpactKind::Water ? "water" : (e.kind == ImpactKind::Ground ? "ground" : "no landing"),
+         e.pts.empty() ? 0.0f : e.pts.back().x, e.pts.empty() ? 0.0f : e.pts.back().y, e.eta, e.last.x, e.last.y,
+         e.sumPath / std::max(1, e.pathN), e.maxPath, remaining, frameStep, within ? "ends where predicted" : "ENDED EARLY/LATE");
+    if (g_evalSum.followed % 10 == 0)
+        Logf("selftest: summary %d shells followed (%d unmodelled, %d too short): mean off-path %.2f, worst %.2f, %d of %d ended within one frame of the predicted landing",
+             g_evalSum.followed, g_evalSum.unmodelled, g_evalSum.noPrediction, g_evalSum.sumPath / g_evalSum.followed, g_evalSum.worstPath,
+             g_evalSum.landedWithinFrame, g_evalSum.followed);
+}
+
+void SelfTestTick(int team) {
+    if (team != g_selfTestTeam) {
+        g_selfTestTeam = team;
+        g_selfTestTicks = 0;
+        g_selfTestEnvAt = 0;
+        g_eval.clear();
+        g_evalSum = EvalSummary{};
+    }
+    // The environment block runs once the own/enemy lists are filled (at the latest after ~30 s) and again a minute later,
+    // when the player has had time to select a gun.
+    ++g_selfTestTicks;
+    if (g_selfTestTicks == 1) g_selfTestEnvAt = 0;
+    if (g_selfTestEnvAt == 0 && g_selfTestTicks >= 240 && ((!g_own.empty() && !g_enemyCodes.empty()) || g_selfTestTicks >= 1800)) {
+        SelfTestEnvironment(team);
+        g_selfTestEnvAt = g_selfTestTicks;
+    } else if (g_selfTestEnvAt > 0 && g_selfTestEnvAt != -1 && g_selfTestTicks == g_selfTestEnvAt + 3600) {
+        SelfTestEnvironment(team);
+        g_selfTestEnvAt = -1;
+    }
+    std::vector<int> codes{team};
+    for (int c : g_enemyCodes) codes.push_back(c);
+    std::set<int> alive;
+    const double tnow = NowSeconds();
+    Vec2f pts[kTraceCap];
+    for (int code : codes) {
+        std::vector<int> ids;
+        if (!g_api.ProjectileIds(code, ids)) continue;
+        for (int id : ids) {
+            if (g_eval.size() > 200 || !alive.insert(id).second) continue;
+            Vec3 p, v;
+            float grav = 0;
+            if (!g_api.NodePos(id, p) || !g_api.NodeVel(id, v)) continue;
+            g_api.ProjectileGravity(id, grav);
+            const bool fresh = g_eval.find(id) == g_eval.end();
+            EvalShell& e = g_eval[id];
+            if (fresh) {
+                e.first = {p.x, p.y};
+                e.firstT = tnow;
+                e.code = code;
+            }
+            const float gMag = std::fabs(grav);
+            const bool beam = gMag < 0.001f;
+            if (e.samples > 0 && !beam && (v.x != e.vx || v.y != e.vy)) {
+                const DragEstimate de = EstimateDragFrames(e.vx, e.vy, v.x, v.y, g_cal.gravitySign * gMag);
+                if (de.ok) {
+                    e.k = de.k;
+                    ++e.good;
+                } else {
+                    ++e.bad;
+                }
+            }
+            e.vx = v.x;
+            e.vy = v.y;
+            e.grav = gMag;
+            ++e.samples;
+            if (!e.predicted && !beam && e.k >= 0.0f) {  // the drag is now measured on this very shell: predict the rest of the flight
+                const TraceResult r = TraceShot({p.x, p.y}, {v.x, v.y}, g_cal.gravitySign * gMag, e.k, kTraceMaxTime, 0.0f, kTraceChord, GroundSegment,
+                                                WaterAt, pts, kTraceCap);
+                e.pts.assign(pts, pts + r.n);
+                e.kind = r.kind;
+                e.eta = r.time;
+                e.predicted = r.n >= 2;
+            } else if (e.predicted) {
+                const float d = PathDistance(e.pts, {p.x, p.y});
+                e.sumPath += d;
+                ++e.pathN;
+                e.maxPath = std::max<double>(e.maxPath, d);
+            }
+            e.last = {p.x, p.y};
+            e.lastVel = {v.x, v.y};
+            e.lastT = tnow;
+        }
+    }
+    for (auto it = g_eval.begin(); it != g_eval.end();) {
+        if (alive.count(it->first)) {
+            ++it;
+            continue;
+        }
+        SelfTestFinish(it->first, it->second);
+        it = g_eval.erase(it);
+    }
+}
+
+// ---------------------------------------------------------------- target under the mouse
+// The aim calculator's target: the enemy device nearest to the world point under the mouse (a second press on the same one clears it).
+void PickTargetUnderMouse() {
+    if (!g_state.aimCalc) SetAimCalc(true);
+    Vec3 screen{}, world{};
+    if (!g_api.MouseWorld(screen, world)) {
+        Logf("pick target: the mouse position could not be read");
+        return;
+    }
+    const EnemyDev* best = nullptr;
+    double bestD = 1.0e30;
+    for (const EnemyDev& e : g_enemy) {
+        const double dx = e.pos.x - world.x, dy = e.pos.y - world.y, d = std::sqrt(dx * dx + dy * dy);
+        if (d < bestD) {
+            bestD = d;
+            best = &e;
+        }
+    }
+    constexpr double kPickRadius = 600.0;  // world units; about the size of a gun cluster
+    if (!best || bestD > kPickRadius) {
+        Logf("pick target: no enemy device within %.0f units of the mouse (%.0f, %.0f); %zu enemy devices known", kPickRadius, world.x, world.y, g_enemy.size());
+        return;
+    }
+    g_state.aimTarget = g_state.aimTarget == best->id ? 0 : best->id;
+    Logf("pick target: %s #%d at distance %.0f from the mouse -> target %d", best->type.c_str(), best->id, bestD, g_state.aimTarget);
 }
 
 // ---------------------------------------------------------------- menu
@@ -1135,10 +2600,16 @@ bool ItemOn(int item) {
         case kItemRepair: return g_state.repair;
         case kItemTrajectory: return g_state.trajectory;
         case kItemImpact: return g_state.impact;
+        case kItemThreats: return g_state.threats;
+        case kItemAimCalc: return g_state.aimCalc;
         case kItemAutoAim: return g_state.autoAim;
         case kItemEnemyOverlay: return g_state.enemyOverlay;
         case kItemRadar: return g_state.radar;
         case kItemIntel: return g_state.intel;
+        case kItemTimers: return g_state.timers;
+        case kItemWeakEnemy: return g_state.weakEnemy;
+        case kItemWeakOwn: return g_state.weakOwn;
+        case kItemStats: return g_state.stats;
         case kItemRecord: return g_state.record;
         default: return false;
     }
@@ -1162,19 +2633,38 @@ void ActivateItem(int item) {
             break;
         case kItemTrajectory: SetTrajectory(!g_state.trajectory); break;
         case kItemImpact: SetImpact(!g_state.impact); break;
+        case kItemThreats: SetThreats(!g_state.threats); break;
+        case kItemAimCalc: SetAimCalc(!g_state.aimCalc); break;
         case kItemAutoAim: SetAutoAim(!g_state.autoAim); break;
         case kItemEnemyOverlay: SetEnemyOverlay(!g_state.enemyOverlay); break;
         case kItemRadar: SetRadar(!g_state.radar); break;
         case kItemIntel: SetIntel(!g_state.intel); break;
+        case kItemTimers: SetTimers(!g_state.timers); break;
+        case kItemWeakEnemy: SetWeakEnemy(!g_state.weakEnemy); break;
+        case kItemWeakOwn: SetWeakOwn(!g_state.weakOwn); break;
+        case kItemStats: SetStats(!g_state.stats); break;
         case kItemRecord: SetRecord(!g_state.record); break;
         case kItemDiagnostics: g_state.wantDiagnostics = true; break;
         case kItemAllOff: AllOff(); break;
+        case kItemPickTarget: PickTargetUnderMouse(); break;
     }
 }
 
 void ActivateRowId(int id) {
     if (id >= 0 && id < kItemCount) {
         ActivateItem(id);
+    } else if (id == kRowIdLanguage) {
+        g_lang = g_lang == 1 ? 0 : 1;
+        SaveLanguage();
+        Logf("menu language: %s", g_lang == 1 ? "ru" : "en");
+    } else if (id == kRowIdScale) {
+        static const float steps[] = {0.85f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f};
+        std::size_t next = 0;
+        for (std::size_t i = 0; i < sizeof(steps) / sizeof(steps[0]); ++i)
+            if (g_menuScale >= steps[i] - 0.01f) next = (i + 1) % (sizeof(steps) / sizeof(steps[0]));
+        g_menuScale = steps[next];
+        SaveMenuScale();
+        Logf("menu scale: %.2f", g_menuScale);
     } else if (id >= kRowIdType && id < kRowIdType + 100) {
         const std::size_t t = static_cast<std::size_t>(id - kRowIdType);
         if (t < g_typeList.size()) g_typeShow[g_typeList[t]] = !ShowType(g_typeList[t]);
@@ -1192,38 +2682,87 @@ std::wstring Widen(const std::string& s) { return std::wstring(s.begin(), s.end(
 // Rows of the selected tab. Combat adds one switch per own weapon type, Enemy one row per aim target.
 void BuildRows(std::vector<MenuRow>& rows) {
     rows.clear();
+    auto languageRow = [] {
+        MenuRow r;
+        r.name = L"Language / Язык";
+        r.desc = Tr(L"Language of the menu and panels", L"Язык меню и панелей");
+        r.toggle = false;
+        r.value = g_lang == 1 ? L"Русский" : L"English";
+        r.id = kRowIdLanguage;
+        return r;
+    };
+    if (g_state.menuTab == 0) rows.push_back(languageRow());  // the language switch is the first thing on the first tab
+    if (g_state.menuTab == 4) {
+        rows.push_back(languageRow());
+        MenuRow scale;
+        scale.name = Tr(L"Menu size", L"Размер меню");
+        scale.desc = Tr(L"Click to make the menu bigger or smaller", L"Клик — сделать меню крупнее или мельче");
+        scale.toggle = false;
+        wchar_t pct[16];
+        swprintf_s(pct, L"%d%%", static_cast<int>(g_menuScale * 100.0f + 0.5f));
+        scale.value = pct;
+        scale.id = kRowIdScale;
+        rows.push_back(std::move(scale));
+        MenuRow section;
+        section.name = Tr(L"HOW TO USE", L"КАК ПОЛЬЗОВАТЬСЯ");
+        section.section = true;
+        rows.push_back(std::move(section));
+        for (const wchar_t* line : {Tr(L"Insert opens and closes this menu. Drag the title bar to move it.", L"Insert открывает и закрывает меню. Двигайте его за заголовок."),
+                                    Tr(L"Every function has a key box: click it, then press the key you want.", L"У каждой функции есть окошко клавиши: кликните и нажмите нужную."),
+                                    Tr(L"Esc in that box removes the key. Toggle: a press switches the function.", L"Esc в окошке убирает клавишу. Переключатель: нажатие включает/выключает."),
+                                    Tr(L"Hold: the function works only while the key is held down.", L"Удержание: функция работает, пока клавиша зажата.")}) {
+            MenuRow note;
+            note.name = line;
+            note.section = true;
+            rows.push_back(std::move(note));
+        }
+        return;
+    }
     for (int i = 0; i < kItemCount; ++i) {
         if (kItemTab[i] != g_state.menuTab) continue;
+        if (const wchar_t* caption = SectionBefore(i)) {
+            MenuRow section;
+            section.name = caption;
+            section.section = true;
+            rows.push_back(std::move(section));
+        }
         MenuRow r;
-        r.name = Widen(kItemNames[i]);
+        r.name = g_lang == 1 ? kItemNamesRu[i] : Widen(kItemNames[i]);
+        r.desc = g_lang == 1 ? kItemDescRu[i] : kItemDescEn[i];
         r.toggle = kItemKinds[i] == aero::ipc::kToggle;
         r.on = ItemOn(i);
         r.id = i;
+        r.bindable = true;
+        r.bindText = g_binds[i].vk ? KeyName(g_binds[i].vk) : std::wstring();
+        r.bindHold = g_binds[i].hold;
+        r.capturing = g_bindCapture == i;
         if (g_online && (i == kItemFastBeams || i == kItemAutoAim)) {
             r.toggle = false;
-            r.value = L"Offline only";
+            r.value = Tr(L"Offline only", L"Только офлайн");
         } else if (g_online && (i == kItemRepairSpeed || i == kItemRepairWhat)) {
             r.toggle = false;
-            r.value = i == kItemRepairSpeed ? L"Game speed" : L"Everything";
+            r.value = i == kItemRepairSpeed ? Tr(L"Game speed", L"Скорость игры") : Tr(L"Everything", L"Всё");
         } else if (i == kItemRepairSpeed) {
             r.toggle = false;
-            r.value = kRepairSpeedNames[std::clamp(g_state.repairLevel, 0, 3)];
+            const int level = std::clamp(g_state.repairLevel, 0, 3);
+            r.value = g_lang == 1 ? kRepairSpeedRu[level] : kRepairSpeedNames[level];
         } else if (i == kItemRepairWhat) {
             r.toggle = false;
-            r.value = kRepairWhatNames[std::clamp(g_state.repairWhat, 0, 2)];
+            const int what = std::clamp(g_state.repairWhat, 0, 2);
+            r.value = g_lang == 1 ? kRepairWhatRu[what] : kRepairWhatNames[what];
         }
         rows.push_back(std::move(r));
     }
     if (g_online && g_state.menuTab == 0) {
         MenuRow section;
-        section.name = L"ONLINE: SWITCHES ABOVE NEED THE AEROHUB MOD IN THE LOBBY";
+        section.name = Tr(L"ONLINE: SWITCHES ABOVE NEED THE AEROHUB MOD IN THE LOBBY", L"ОНЛАЙН: ДЛЯ ЭТОГО НУЖЕН МОД AEROHUB В ЛОББИ");
         section.section = true;
         rows.push_back(std::move(section));
     }
     g_typeList.clear();
     if (g_state.menuTab == 1 && !g_typeCount.empty()) {
         MenuRow section;
-        section.name = L"GUNS SHOWN (TRAJECTORY AND AUTO-AIM)";
+        section.name = Tr(L"GUNS SHOWN (TRAJECTORY AND AUTO-AIM)", L"ОРУДИЯ ДЛЯ ТРАЕКТОРИИ И АВТОНАВЕДЕНИЯ");
         section.section = true;
         rows.push_back(std::move(section));
         for (const auto& [name, count] : g_typeCount) {
@@ -1238,7 +2777,8 @@ void BuildRows(std::vector<MenuRow>& rows) {
     }
     if (g_state.menuTab == 2) {
         MenuRow section;
-        section.name = g_targets.empty() ? L"AUTO-AIM TARGET (NO ENEMY GUNS SEEN YET)" : L"AUTO-AIM TARGET (NEAREST TO CAMERA)";
+        section.name = g_targets.empty() ? Tr(L"AUTO-AIM TARGET (NO ENEMY GUNS SEEN YET)", L"ЦЕЛЬ АВТОНАВЕДЕНИЯ (ВРАЖЕСКИХ ОРУДИЙ ЕЩЁ НЕТ)")
+                                         : Tr(L"AUTO-AIM TARGET (NEAREST TO CAMERA)", L"ЦЕЛЬ АВТОНАВЕДЕНИЯ (БЛИЖАЙШИЕ К КАМЕРЕ)");
         section.section = true;
         rows.push_back(std::move(section));
         Vec3 cam;
@@ -1272,13 +2812,81 @@ void StepSelection(int dir, const std::vector<MenuRow>& rows) {
     g_state.menuKeyboard = true;
 }
 
+bool g_capPrev[256]{};
+
+// Remember which keys are down now, so a key that is already held when the capture starts is not taken as the answer.
+void ArmCapture() {
+    for (int vk = 1; vk < 255; ++vk) g_capPrev[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+// While a key box waits for a key: the first newly pressed key is the answer (Esc removes the bind). Insert stays the menu key.
+void PollCapture() {
+    if (g_bindCapture < 0) return;
+    for (int vk = 1; vk < 255; ++vk) {
+        const bool down = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        const bool edge = down && !g_capPrev[vk];
+        g_capPrev[vk] = down;
+        if (!edge || vk == VK_LBUTTON || vk == VK_RBUTTON || vk == VK_SHIFT || vk == VK_CONTROL || vk == VK_MENU || vk == kKeyMenu) continue;
+        const int item = g_bindCapture;
+        g_bindCapture = -1;
+        if (vk == VK_ESCAPE) {
+            g_binds[item].vk = 0;
+            g_binds[item].hold = false;
+            Logf("bind: item %d key removed", item);
+        } else {
+            for (int other = 0; other < kItemCount; ++other)
+                if (other != item && g_binds[other].vk == vk) g_binds[other] = Bind{};  // a key serves one action
+            g_binds[item].vk = vk;
+            Logf("bind: item %d -> %ls", item, KeyName(vk).c_str());
+        }
+        SaveBinds();
+        return;
+    }
+}
+
+// Runs the key binds. Toggle mode: each press activates the action. Hold mode (switches only): on while the key is down, back to
+// the state it had before when it is released.
+void RunBinds() {
+    if (g_bindCapture >= 0) return;  // keys are being chosen; none of them may fire anything
+    for (int i = 0; i < kItemCount; ++i) {
+        const Bind& b = g_binds[i];
+        if (b.vk == 0) {
+            g_keyPrev[i] = false;
+            continue;
+        }
+        const bool down = (GetAsyncKeyState(b.vk) & 0x8000) != 0;
+        if (b.hold && kItemKinds[i] == aero::ipc::kToggle) {
+            if (down && !g_holdDown[i]) {
+                g_holdDown[i] = true;
+                g_holdPrev[i] = ItemOn(i);
+                if (!g_holdPrev[i]) ActivateItem(i);
+            } else if (!down && g_holdDown[i]) {
+                g_holdDown[i] = false;
+                if (!g_holdPrev[i] && ItemOn(i)) ActivateItem(i);
+            }
+        } else if (down && !g_keyPrev[i]) {
+            ActivateItem(i);
+        }
+        g_keyPrev[i] = down;
+    }
+}
+
+// The game lost focus (or the bind changed): a hold-mode function must not stay on.
+void ReleaseHolds() {
+    for (int i = 0; i < kItemCount; ++i) {
+        if (!g_holdDown[i]) continue;
+        g_holdDown[i] = false;
+        if (!g_holdPrev[i] && ItemOn(i)) ActivateItem(i);
+    }
+}
+
 void HandleKeys() {
-    if (Pressed(kKeyAllOff)) AllOff();
-    if (Pressed(kKeyUnlimited)) SetUnlimited(!g_state.unlimited);
     if (Pressed(kKeyMenu)) {
         g_state.menuOpen = !g_state.menuOpen;
+        g_bindCapture = -1;
         Logf("menu: %d", g_state.menuOpen ? 1 : 0);
     }
+    RunBinds();
 }
 
 // Lays out, handles the mouse and keyboard for, and paints the in-game menu. Called inside an overlay pass.
@@ -1288,7 +2896,8 @@ void RunMenu(HDC dc, int vw, int vh) {
     if (g_state.menuSel >= static_cast<int>(view.rows.size())) g_state.menuSel = 0;
 
     // Keyboard: arrows move inside the tab, Left/Right switch the row.
-    if (GameWindowFocused()) {
+    if (GameWindowFocused()) PollCapture();
+    if (GameWindowFocused() && g_bindCapture < 0) {
         if (Pressed(kMenuUp)) StepSelection(-1, view.rows);
         if (Pressed(kMenuDown)) StepSelection(+1, view.rows);
         const bool left = Pressed(kMenuLeft), right = Pressed(kMenuRight);
@@ -1298,7 +2907,8 @@ void RunMenu(HDC dc, int vw, int vh) {
             BuildRows(view.rows);
         }
     }
-    g_menu.Layout(vw, vh, view.rows, 4);
+    BuildRows(view.rows);  // PollCapture may have changed a key box
+    g_menu.Layout(vw, vh, view.rows, kTabCount, g_menuScale);
 
     HWND wnd = WindowFromDC(dc);
     RECT rc{};
@@ -1323,15 +2933,30 @@ void RunMenu(HDC dc, int vw, int vh) {
             if (hit == MenuHit::Close) {
                 g_state.menuOpen = false;
             } else if (hit == MenuHit::Tab) {
-                g_state.menuTab = std::clamp(index, 0, 3);
+                g_state.menuTab = std::clamp(index, 0, kTabCount - 1);
                 g_state.menuSel = 0;
+                g_bindCapture = -1;
                 BuildRows(view.rows);
-            } else if (hit == MenuHit::Row && index >= 0 && index < static_cast<int>(view.rows.size())) {
+            } else if (index >= 0 && index < static_cast<int>(view.rows.size())) {
+                const int rowId = view.rows[static_cast<std::size_t>(index)].id;
                 g_state.menuSel = index;
-                ActivateRowId(view.rows[static_cast<std::size_t>(index)].id);
+                if (hit == MenuHit::Key && rowId >= 0 && rowId < kItemCount) {  // choose a key for this action
+                    g_bindCapture = g_bindCapture == rowId ? -1 : rowId;
+                    ArmCapture();
+                } else if (hit == MenuHit::Mode && rowId >= 0 && rowId < kItemCount) {  // toggle <-> hold
+                    g_binds[rowId].hold = !g_binds[rowId].hold;
+                    if (!g_binds[rowId].hold && g_holdDown[rowId]) ReleaseHolds();
+                    SaveBinds();
+                    Logf("bind: item %d mode %s", rowId, g_binds[rowId].hold ? "hold" : "toggle");
+                } else if (hit == MenuHit::Row) {
+                    g_bindCapture = -1;
+                    ActivateRowId(rowId);
+                }
             }
         }
-        cursorInside = g_state.menuOpen && (g_menu.Inside(px, py) || g_menu.Pressing());
+        const bool onMenu = g_state.menuOpen && (g_menu.Inside(px, py) || g_menu.Pressing());
+        const bool onPanel = g_state.menuOpen && PanelPointer(px, py, down, onMenu);
+        cursorInside = onMenu || onPanel;
         // The game keeps seeing the last position outside the menu while the cursor is over it.
         if (!cursorInside || lastOutside.x < 0) lastOutside = screenPt;
         g_neutralPt = lastOutside;
@@ -1342,11 +2967,21 @@ void RunMenu(HDC dc, int vw, int vh) {
     if (!g_state.menuOpen) return;
 
     BuildRows(view.rows);  // states may have changed by the click above
-    g_menu.Layout(vw, vh, view.rows, 4);
-    for (const wchar_t* name : kTabNames) view.tabs.push_back(name);
+    g_menu.Layout(vw, vh, view.rows, kTabCount, g_menuScale);
+    for (int t = 0; t < kTabCount; ++t) view.tabs.push_back(g_lang == 1 ? kTabNamesRu[t] : kTabNames[t]);
     view.tab = g_state.menuTab;
     view.subtitle = L"Forts";
-    view.pill = g_online ? L"Online" : (g_inMatch ? L"In match" : L"Not in match");
+    view.noKey = L"—";
+    view.pressKey = Tr(L"Press a key...", L"Нажмите клавишу...");
+    view.modeToggle = Tr(L"Toggle", L"Переключ.");
+    view.modeHold = Tr(L"Hold", L"Удержание");
+    if (g_lang == 1) {
+        view.on = L"ВКЛ";
+        view.off = L"ВЫКЛ";
+        view.run = L"Запуск";
+        view.footer = L"Кликните окошко клавиши и нажмите кнопку (Esc — убрать). Переключ. — нажатием, Удержание — пока зажата.";
+    }
+    view.pill = g_online ? Tr(L"Online", L"Онлайн") : (g_inMatch ? Tr(L"In match", L"В матче") : Tr(L"Not in match", L"Не в матче"));
     view.pillColor = g_online ? aero::ui::kWarn : (g_inMatch ? aero::ui::kOk : aero::ui::kDim);
     view.keyboardFocus = g_state.menuKeyboard ? g_state.menuSel : -1;
     const bool changed = g_menu.Render(view);
@@ -1370,8 +3005,10 @@ void ApplyToggle(LONG request, bool current, void (*set)(bool)) {
 void ApplyRequests() {
     if (!g_ipc.Ready()) return;
     void (*const setters[kItemCount])(bool) = {SetUnlimited, SetFastBeams, SetFastDevices, SetFastReload, SetCommander, SetRepair,
-                                                nullptr, nullptr, SetTrajectory, SetImpact, SetAutoAim, SetEnemyOverlay, SetRadar, SetIntel, SetRecord,
-                                                nullptr, nullptr};
+                                                nullptr, nullptr,  // repair speed / what
+                                                SetTrajectory, SetImpact, SetThreats, SetAimCalc, SetAutoAim,
+                                                SetEnemyOverlay, SetRadar, SetIntel, SetTimers, SetWeakEnemy, SetWeakOwn,
+                                                SetStats, SetRecord, nullptr, nullptr, nullptr};  // diagnostics, all off, pick target
     for (int i = 0; i < kItemCount; ++i) {
         const LONG r = g_ipc.TakeRequest(g_featureId[i]);
         if (!r) continue;
@@ -1429,6 +3066,7 @@ void Tick(HDC dc) {
     if (g_api.Multiplayer(online)) UpdateOnline(online);
     ApplyRequests();
     if (GameWindowFocused()) HandleKeys();
+    else ReleaseHolds();
     PublishState();
 
     const bool inWorld = g_api.InWorld();
@@ -1437,8 +3075,12 @@ void Tick(HDC dc) {
     UpdateTelemetry(inWorld, haveTeam, team);
     g_inMatch = haveTeam;
     if (!haveTeam) {  // outside a match only the menu is drawn
+        if (g_stats.active) ExportStats();
+        g_traceCache.clear();
+        g_threats.clear();
         ResetModSwitches();
         int w = 0, h = 0;
+        for (auto& entry : g_spots) entry.second.shown = false;
         if (g_state.menuOpen && g_overlay.Begin(dc, w, h)) {
             g_uiScale = std::clamp(static_cast<float>(h) / 1080.0f, 0.8f, 2.5f);
             RunMenu(dc, w, h);
@@ -1449,6 +3091,8 @@ void Tick(HDC dc) {
 
     if (team != g_syncTeam) {
         g_syncTeam = team;
+        if (g_stats.active) ExportStats();  // a new match: the previous one is written out
+        g_traceCache.clear();
         ResetModSwitches();
     }
     g_offlineFrames = g_online ? 0 : std::min(g_offlineFrames + 1, kOfflineSettleFrames);
@@ -1471,8 +3115,23 @@ void Tick(HDC dc) {
         ApplyRepair(team);
     }
 
-    const bool needWorld = g_state.enemyOverlay || g_state.radar || g_state.intel || g_state.autoAim || (g_state.menuOpen && g_state.menuTab == 2);
+    const bool needWorld = g_state.enemyOverlay || g_state.radar || g_state.intel || g_state.autoAim || g_state.threats || g_state.aimCalc ||
+                           g_state.timers || g_state.weakEnemy || g_state.weakOwn || g_state.stats || (g_state.menuOpen && g_state.menuTab == 2) ||
+                           g_selfTest;
     if (needWorld) RefreshWorld(team, g_state.radar);
+    if (g_selfTest) SelfTestTick(team);
+    if (g_state.threats) UpdateThreats();
+    else g_threats.clear();
+    if (g_state.aimCalc) UpdateAimCalc(team);
+    if (g_state.weakEnemy || g_state.weakOwn) UpdateWeak(team);
+    if (g_state.stats) {
+        if (!g_stats.active) ResetStats();
+        TrackShots(team);
+        UpdateDamage();
+        RefreshStatsPanel();
+    } else if (g_stats.active) {
+        ExportStats();
+    }
     if (offline) ApplyAutoAim(team);
     if (g_state.record) RecordSamples(team);
     if (g_state.wantDiagnostics) {
@@ -1480,7 +3139,8 @@ void Tick(HDC dc) {
         Diagnostics(team);
     }
 
-    const bool draw = g_state.trajectory || g_state.menuOpen || g_state.enemyOverlay || g_state.radar || g_state.intel;
+    const bool worldDraw = g_state.trajectory || g_state.enemyOverlay || g_state.threats || g_state.aimCalc || g_state.weakEnemy || g_state.weakOwn;
+    const bool draw = worldDraw || g_state.menuOpen || g_state.radar || g_state.intel || g_state.stats;
     if (!draw) return;
     if (g_state.trajectory || g_state.menuOpen) RefreshTypes(team);
     if (g_state.trajectory) {
@@ -1490,13 +3150,20 @@ void Tick(HDC dc) {
     int w = 0, h = 0;
     if (!g_overlay.Begin(dc, w, h)) return;
     g_uiScale = std::clamp(static_cast<float>(h) / 1080.0f, 0.8f, 2.5f);
+    g_viewW = w;
+    g_viewH = h;
+    for (auto& entry : g_spots) entry.second.shown = false;
     g_hitIds.clear();
-    if ((g_state.trajectory || g_state.enemyOverlay) && PrepareCalibration(w, h)) {
+    if (worldDraw && PrepareCalibration(w, h)) {
+        if (g_state.weakEnemy || g_state.weakOwn) DrawWeak();
         if (g_state.trajectory) DrawTrajectories(team);
+        if (g_state.aimCalc) DrawAimGhost();
         if (g_state.enemyOverlay) DrawEnemies(w, h);
+        if (g_state.threats) DrawThreats(w);
     }
     if (g_state.radar) DrawRadar(w);
     if (g_state.intel) DrawIntel(w);
+    DrawLeftPanels();
     if (g_state.menuOpen) RunMenu(dc, w, h);
     g_overlay.End();
 }

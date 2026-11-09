@@ -240,3 +240,65 @@ Done:
 Checked here: `gradlew build` exit 0; `runSelftest` PASSED; `runWorldtest` 162 passed / 0 failed. New scenarios: night vision (8 phases), wooden pickaxe stops, no pickaxe stops, pickaxe only in the main inventory, 50-block flat road, 50-block bumpy road, 5-ore diagonal vein with a nearer decoy ore. The bumpy road reproduces the loop with the old code (75 blocks walked for a 50-block road) and passes with the fix (269 ticks); the flat road did not reproduce it with the old code.
 Not verified: the circling in the user's real world (cause matched on a synthetic road only); tool durability is ignored (a nearly broken pickaxe can be chosen); a tool breaking mid-vein is handled by the pre-block check but has no test; X-Ray with Iris and other Sodium versions; servers that strip the night vision effect; Nuker and AutoLumber still use the hotbar only; the new jar was not run in the user's real profile.
 Next verifiable step: put `build/out/modules/aeroclient.jar` into the profile, mine a diamond vein with an iron pickaxe, then a road over hills; if it loops again, take `logs/latest.log` and the terrain description.
+
+## Update 23: terrain/water-aware trajectory, incoming shells, aim calculator, weak links, enemy timers, battle stats
+
+Request: everything from "information and analysis" list 1 (works online without the mod because it only reads); and the trajectory must run to the end of the ground, with water treated as a separate surface (the user had a water problem in an earlier trajectory mod).
+
+Measured (static, Forts.exe on disk, buildid 26181732; `tools/forts_api_table.py` dumps every Lua-API name -> handler from the registration code, the pairs `lea r8,[handler]` / `lea rdx,[name]`; 1333 names, known handlers matched FortsConfig.hpp):
+- GetWaterLevel 0xE05B0 `float(float x)`: piecewise-constant table (world+0x12E8..0x12F0, 12-byte entries); ~2.1e9 on maps without water. GetWaterDepthAt 0xE0540 = pos.y - level, so deeper is a LARGER y (gravity +y): in the water when y >= GetWaterLevel(x). All real calibrations in FortsModule.log say gravitySign=1.
+- CastGroundRay 0xD9570 `int(const Vec3* a, const Vec3* b, int flags)` (1 = terrain hit; flags 0 as the game's own mods pass it), GetRayHitPosition 0xD9E60 `Vec3*(Vec3* out)`.
+- IsWeaponReadyToFire 0xD7610 `bool(int id)`, GetWeaponReloadTime 0xE41B0 `float(int id)` (= period * fraction at weapon+0x4B8), GetWeaponReloadPeriodById 0xE3F30; none checks the team. Node field +0x18 = terrain block index (GetNodeGroundBlockIndex 0xE2690).
+- Config entries are in FortsConfig.hpp; their RVAs and prologues were cross-checked against the dump.
+
+Done: `Tactics.hpp` (pure: TraceShot with ground + water, SolveAim, FindWeakLinks (bridges of the support graph), LostLinks, DragFromSpeeds), `Ballistics.hpp::ArcAt`, GameApi (GroundRay, WaterLevelAt, WeaponReady, WeaponReload, BaseGraphOf), Features.cpp: trajectory stops at terrain or water and marks the landing point with the flight time (yellow = ground, blue = water); menu items "Incoming shells warning", "Aim calculator (needs a target)", "Enemy gun timers", "Weak links: enemy base / your base", "Battle stats panel" (all read-only, allowed online; 23 of the hub channel's 24 feature slots are used). Battle stats append one line per match to `FortsStats.csv` next to the module.
+Checked here: Tactics checks (4254, incl. brute-force comparison of weak links on random graphs, round-trip of the aim solver, water/terrain cases); menu and panels rendered offline from the real Menu.cpp / Hud.cpp (no truncation). Built: `cmake --build build --config Release --target FortsModule`, exit 0.
+
+NOT verified in game (the log lines to look at are in brackets):
+- That calling the new handlers from the SwapBuffers hook is safe and returns what the disassembly says; the price of a ray cast ("terrain ray: N casts, X us per cast"). If it is high, trace steps in `TraceCached` need to be coarser.
+- Terrain contacts within 30 units of the barrel are ignored (kTraceGrace); what CastGroundRay does for a segment that starts inside terrain is unknown.
+- ProjectileIds(enemy team code) returns the enemy's shells (shells are probably listed per side; ids are de-duplicated). Threat radius 90 units is not calibrated against real splash.
+- Weak links assume node+0x18 >= 0 means anchored to terrain; a device hangs on the nearest link within 60 units; weights (reactor 1000, gun 120, other 10) are priorities, not measurements. If no anchored node is found the panel says so.
+- Enemy timers: the sign of GetWeaponReloadTime is learned from the first reloads seen to the end ("timers: the reload value counts ..."); until then the bar is amber and only READY is exact.
+- Battle stats are estimates (shots from our projectiles appearing, hit = last point within 90 units of an enemy device, damage = loss of device HP between refreshes).
+
+Next verifiable step: start Forts on OpenGL, inject, in a match turn the features on; on a water map (dlc2_MP 2) check that shells end on the surface; read FortsModule.log for the lines above; send the log with Collect logs.
+
+
+## Update 24: exact trajectory physics (frame model, measured drag, stops)
+
+Request: "Траектория должна быть максимально точная".
+
+Measured (501 recorded shots, Physics.FramesRate=25, 4998 positions):
+- The game steps projectiles in fixed frames h = 0.04 s: `vx -= k*vx*h; vy += (g - k*vy)*h; x += vx*h; y += vy*h` (semi-implicit, drag from the old velocity, linear drag). y points down.
+- k = 4.0 * ProjectileDrag (kDragFactor evidence comes from ONE type: machinegun 0.021 -> 0.0840; cannon 0). The module also measures k live from consecutive velocity samples (EstimateDragFrames) and prefers that (n >= 2) over the formula.
+- Shells with ProjectileDrag >= 2 (missile 64) are thrust driven: not predicted, no trajectory drawn.
+- Old model vs recorded positions (mean error, world units): cannon <=1 s 10.5 -> 0.05, 1-2 s 23.0 -> 0.06; machinegun <=1 s 27.4 -> 0.06, 1-2 s 130 -> 0.07 (max 235 -> 0.19). The old numbers use the learned drag the old FortsDrag.ini held, so they show what the user saw.
+
+Code: `modules/forts/Tactics.hpp` (`TraceShot` frame by frame with terrain ray per chunk, water crossing interpolated, grace distance; `EstimateDragFrames`; `SolveAim` on the same physics), `Features.cpp` (`DragFor`: measured -> formula -> 0; learned values in `FortsDrag.v2.ini`, the old biased file is ignored), `Ballistics.hpp` (`ArcAt`, legacy).
+
+Isolated checks (scratchpad tactics_test.cpp): 593 passed, 0 failed, including real-data validation (worst position error 0.186, rms 0.066) and the drag estimator exact on 4975/4975 real pairs.
+
+Not verified in game / not modeled:
+- Launch offset: the first shell state seen vs barrel + FireVelocity. `launch:` lines (<=40 per session) are written to FortsModule.log for calibration.
+- Stops on structures (CastRay semantics unverified), shields/fields speed drops, thrust shells, fire spread, moving barrels.
+- Cost of terrain rays and thread safety of the new handlers in the SwapBuffers hook ("terrain ray: ... us per cast" in the log).
+
+Release: nothing committed/pushed; no v1.3.0 approval. dist/ installer is still v1.2.0.
+
+Update 25: menu language (EN/RU). First row of the General tab ("Language / Язык") switches; the choice is saved in FortsLang.ini next to FortsModule.dll. Rows are grouped under captions. Hub window feature names and in-game HUD panels (stats, aim, weak links) stay English. Not verified in game; rendered in isolation with the real Menu.cpp (the Russian strings fit after shortening the repair-speed values and the online note).
+
+Update 26: menu redesign, key binds, calculator on the selected gun, passive self-test
+- Menu (Menu.cpp/.hpp rewritten): 820-unit wide window, a card per function with a one-line description, a key box and a Toggle/Hold box per function, header drag to move, Settings tab (language, menu size 85-200%). Binds are stored in FortsBinds.ini (item<N>=vk,hold; defaults F6 unlimited, End all off, F9 pick target), language/size in FortsLang.ini.
+- Aim calculator: uses the gun returned by GetLocalSelectedDeviceId (0xCF710, int(), prologue-checked; "selected" semantics unverified in game); target is chosen with the new "Pick target under cursor" bind via GetMousePos (0xE6700) + ScreenToWorld (0xE68B0) (same screen space is unverified; the self-test logs a round trip).
+- Self-test (passive, never fires): a file FortsSelfTest.txt next to the DLL enables it. It logs, about 4 s into a match, camera water level, terrain ray cost, selected device, node+0x18 values of every base, weapon timers, mouse->world; and for every shell it predicts the path after the drag is measured and logs how far the last seen point was from the path and whether the shell ended where predicted ("selftest:" lines in FortsModule.log). Old 40 MB log kept as FortsModule.before-selftest.log.
+- Weak links "no ground-anchored nodes found": likely floating (ship) bases; the self-test node+0x18 distribution decides. Not changed yet.
+- Built: cmake --build build --config Release --target FortsModule, exit 0. Not run in game.
+
+Update 27 (test run, interrupted): first in-game run with FortsSelfTest.txt. Measured: ScreenToWorld round trip exact; terrain ray 1.78 us/cast; GetLocalSelectedDeviceId faulted with no gun selected (re-check with a gun selected); environment block fired before the lists were filled (fixed in Features.cpp: runs when own/enemy lists are non-empty, again 60 s later; compiles, DLL not yet rebuilt because Forts held it). Next: close Forts, rebuild FortsModule, play a skirmish (water map dlc2_MP 2), select a gun, run `python -I selftest_report.py <FortsModule.log>` (scratchpad) for the shell/landing report; decide weak-links anchor from the node+0x18 distribution.
+
+## Update 28 (2026-11-09): movable HUD panels
+- Request: "Все оверлеи тоже должны перетаскиваться". Panels aimcalc, weak, stats, intel, radar (Features.cpp, section "movable panels": PlacePanel, PanelPointer, FortsPanels.ini).
+- Works only while the menu is open: left-drag moves a panel, right-click resets it. Position is clamped to the viewport; the game does not receive the mouse over a panel (same path as the menu).
+- Built (cmake --build build --config Release --target FortsModule, exit 0, DLL 18:12). NOT run in game. World-attached overlays (enemy labels, timers, trajectories) are not panels and are not movable.
+- Offline checks this session: tactics_test 589 passed / 0 failed; preview_ru renders the menu (820x722 and 820x548), images not visually reviewed.

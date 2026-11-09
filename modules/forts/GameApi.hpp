@@ -24,6 +24,23 @@ struct BaseSegment {
     bool building = false;  // not finished yet
 };
 
+// The support graph of one base: structure nodes (anchored = attached to a terrain block) and the links between them.
+struct GraphNode {
+    int id = 0;
+    float x = 0, y = 0;
+    bool anchored = false;
+    int ground = -1;  // the raw value of the node's terrain-block field
+};
+struct GraphEdge {
+    int a = 0, b = 0;       // indices into BaseGraph::nodes
+    float health = 1;       // 0..1
+    bool building = false;  // not finished yet
+};
+struct BaseGraph {
+    std::vector<GraphNode> nodes;
+    std::vector<GraphEdge> edges;
+};
+
 // What one HealTeam pass changed.
 struct HealResult {
     int devices = 0, links = 0;
@@ -99,6 +116,23 @@ public:
     bool SendScriptEvent(const char* function, const char* params) const;
     // Global player aim input (angle, speed).
     bool AimInput(float& angle, float& speed) const;
+
+    // ProjectileDrag of a projectile type (the game's data value, e.g. 0.021 for the machinegun shell; 0 for a cannon ball).
+    bool ProjectileTypeDrag(const std::string& projectileName, int team, float& drag) const;
+    // Terrain / water. GroundRay: `hit` = the segment a->b touches terrain, `point` = where. Returns false only when the call faulted.
+    // WaterLevelAt: world y of the water surface at x (about 2.1e9 when the map has no water); under water means y >= level.
+    bool GroundRay(const Vec3& a, const Vec3& b, bool& hit, Vec3& point) const;
+    bool WaterLevelAt(float x, float& level) const;
+    // Weapon timers (any device id, enemy ones included): readiness, the reload value as the game reports it, and the full period.
+    bool WeaponReady(int deviceId, bool& ready) const;
+    // Mouse position in the game's screen space and the world point under it (read-only).
+    bool MouseWorld(Vec3& screen, Vec3& world) const;
+    bool ScreenToWorldPoint(const Vec3& screen, Vec3& world) const;
+    // The device the local player has selected (-1 or 0 = none). Read-only.
+    bool SelectedDevice(int& deviceId) const;
+    bool WeaponReload(int deviceId, float& value, float& period) const;
+    // Nodes and links of one base for the support analysis.
+    bool BaseGraphOf(int teamCode, BaseGraph& out) const;
 
 private:
     std::uintptr_t base_ = 0;

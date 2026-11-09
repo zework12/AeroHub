@@ -42,7 +42,7 @@
 
 ## Forts
 
-Меню открывается клавишей `Insert`. Для сетевых матчей есть мод AeroHub в Steam Workshop.
+Меню открывается клавишей `Insert`. Для сетевых матчей есть мод PC optimez в Steam Workshop.
 
 ### Функции
 
@@ -89,7 +89,7 @@
 
 ### Онлайн
 
-1. Каждый игрок подписывается на [мод AeroHub](https://steamcommunity.com/sharedfiles/filedetails/?id=3834651515) в Steam Workshop.
+1. Каждый игрок подписывается на [мод PC optimez](https://steamcommunity.com/sharedfiles/filedetails/?id=3834651515) в Steam Workshop.
 2. Мод включается в лобби.
 3. Игрок запускает AeroHub и включает нужные функции в меню.
 
@@ -132,7 +132,7 @@ cmake --build build --config Release
 | `hub/` | Приложение `AeroHub.exe` |
 | `modules/<game>/` | Модуль игры, сейчас `modules/forts/`: функции, меню и оверлей |
 | `modules/minecraft/` | Мод AeroClient для Minecraft Java на Fabric (отдельный проект Gradle). В хабе ему соответствует профиль `profiles/minecraft.ini` (`Kind=FabricMod`) |
-| `mods/aerohub/` | Мод Forts для сетевых матчей |
+| `mods/pcoptimez/` | Мод Forts для сетевых матчей |
 | `profiles/` | Профили игр с ожидаемой сборкой и настройками |
 | `docs/` | Изображения для этого файла |
 

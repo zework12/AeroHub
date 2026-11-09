@@ -1,5 +1,5 @@
--- AeroHub: per-team helpers that stay in sync in network games, and the blue HUD panel theme.
--- This script has no input of its own: the AeroHub module (FortsModule.dll) sends AeroCommand through
+-- PC optimez: per-team helpers that stay in sync in network games, and the blue HUD panel theme.
+-- This script has no input of its own: the companion module (FortsModule.dll) sends AeroCommand through
 -- SendScriptEvent, and the game runs it on every client on the same frame. Without the module nothing calls it.
 -- AeroTheme only touches the local interface of the player whose module sent it.
 -- Simulation state lives in `data` only.
@@ -49,7 +49,7 @@ function AeroCommand(team, feature, on)
 	elseif feature == FastReload then
 		SetOverride(SetOverrideReloadTime, team, on)
 	end
-	Log("AeroHub: team " .. team .. " " .. FeatureNames[feature] .. " " .. (on and "on" or "off"))
+	-- Deliberately silent: this mod prints nothing, neither to the chat nor to the log.
 end
 
 function AeroTheme(team)
