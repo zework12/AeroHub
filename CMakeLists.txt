@@ -22,12 +22,13 @@ add_library(AeroCore STATIC
   core/Minecraft.cpp
   core/Diagnostics.cpp
   core/IatHook.cpp
-  core/Ipc.cpp)
+  core/Ipc.cpp
+  core/Update.cpp)
 target_include_directories(AeroCore PUBLIC core)
 
 # The application: lists game profiles, validates the running build, injects the module.
 add_executable(AeroHub WIN32 hub/main.cpp hub/AeroHub.rc)
-target_link_libraries(AeroHub PRIVATE AeroCore gdiplus dwmapi uxtheme shell32 ole32 user32 gdi32)
+target_link_libraries(AeroHub PRIVATE AeroCore gdiplus dwmapi uxtheme shell32 ole32 user32 gdi32 winhttp bcrypt)
 target_link_options(AeroHub PRIVATE "/MANIFESTUAC:NO")
 
 # Forts module (loaded into Forts.exe by the hub).

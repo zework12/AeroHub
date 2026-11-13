@@ -1,4 +1,4 @@
-﻿// AeroHub: control panel for game cheat modules.
+// AeroHub: control panel for game cheat modules.
 //  - sidebar with every game profile and its state
 //  - header with the selected game's status and one primary action (Inject / Launch)
 //  - live telemetry once the module is loaded (shared-memory control channel); the cheats themselves
@@ -20,7 +20,9 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "Diagnostics.hpp"
@@ -31,6 +33,8 @@
 #include "Process.hpp"
 #include "Profile.hpp"
 #include "Ui.hpp"
+#include "Update.hpp"
+#include "Version.hpp"
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -45,6 +49,7 @@ using Gdiplus::RectF;
 using namespace aero::ui;
 
 constexpr UINT_PTR kTimer = 1;
+constexpr UINT kMsgUpdate = WM_APP + 1;  // wParam: 1 = the version check finished, 2 = the installer download finished
 constexpr UINT_PTR kEditHub = 301, kEditModule = 302;
 constexpr double kMinProcessAgeForAutoInject = 8.0;  // seconds; lets the game finish resolving its imports
 constexpr int kStaleTicksBeforeWarning = 3;
@@ -67,7 +72,7 @@ struct Link {
     Level level = Level::Idle;
 };
 
-enum class Act { None, SelectGame, Primary, Secondary, Refresh, AutoSwitch, TabModule, TabHub, CollectLogs, SwitchOpenGl };
+enum class Act { None, SelectGame, Primary, Secondary, Refresh, AutoSwitch, TabModule, TabHub, CollectLogs, SwitchOpenGl, Update, LangEn, LangRu };
 struct Hit {
     RectF r;
     Act act = Act::None;
@@ -126,6 +131,11 @@ std::unique_ptr<Gdiplus::Font> g_fTitle, g_fH2, g_fBody, g_fBodyBold, g_fSmall, 
 
 float S(float v) { return v * static_cast<float>(g_dpi) / 96.0f; }
 
+// Interface language: 0 = English, 1 = Russian (AeroHub.ini [Hub] Language=en|ru; the first run follows the Windows UI language).
+// The Hub log and the module's own lines stay English on purpose: they are what a bug report shows.
+int g_lang = 0;
+const wchar_t* Tr(const wchar_t* en, const wchar_t* ru) { return g_lang == 1 ? ru : en; }
+
 COLORREF LevelColor(Level l) {
     switch (l) {
         case Level::Ready: return kWarn;
@@ -137,10 +147,10 @@ COLORREF LevelColor(Level l) {
 
 const wchar_t* LevelWord(Level l) {
     switch (l) {
-        case Level::Ready: return L"Ready to inject";
-        case Level::Active: return L"Active";
-        case Level::Bad: return L"Needs attention";
-        default: return L"Not running";
+        case Level::Ready: return Tr(L"Ready to inject", L"Готов к внедрению");
+        case Level::Active: return Tr(L"Active", L"Активен");
+        case Level::Bad: return Tr(L"Needs attention", L"Нужно внимание");
+        default: return Tr(L"Not running", L"Не запущена");
     }
 }
 
@@ -174,6 +184,164 @@ void AppendText(HWND edit, const std::wstring& text) {
 }
 
 void Log(const std::wstring& line) { AppendText(g_editHub, line + L"\r\n"); }
+
+// ---------------------------------------------------------------- updates
+// The hub asks GitHub for the latest release (at start and on the sidebar button). Installing is always the user's click: the installer
+// is downloaded, checked against the SHA-256 GitHub reports for that file, and then started while the hub closes.
+enum class UpState { Idle, Checking, UpToDate, Available, Downloading, Failed };
+struct UpdateState {
+    UpState state = UpState::Idle;
+    aero::update::Release release;
+    std::wstring message;
+} g_up;
+std::mutex g_upLock;
+bool g_checkUpdates = true;  // AeroHub.ini [Hub] CheckUpdates=0 turns the check at start off
+
+UpState UpdateNow() {
+    std::lock_guard<std::mutex> lock(g_upLock);
+    return g_up.state;
+}
+
+std::filesystem::path UpdateInstallerPath() {
+    wchar_t tmp[MAX_PATH + 2]{};
+    const DWORD n = GetTempPathW(static_cast<DWORD>(std::size(tmp)), tmp);
+    return (n > 0 && n < std::size(tmp) ? std::filesystem::path(tmp) : std::filesystem::path(L"C:\\Windows\\Temp")) / L"AeroHub-Update" / L"AeroHub-Setup.exe";
+}
+
+void StartVersionCheck() {
+    if (g_demo) return;
+    {
+        std::lock_guard<std::mutex> lock(g_upLock);
+        if (g_up.state == UpState::Checking || g_up.state == UpState::Downloading) return;
+        g_up.state = UpState::Checking;
+        g_up.message.clear();
+    }
+    const HWND hwnd = g_hwnd;
+    std::thread([hwnd] {
+        aero::update::Release rel = aero::update::FetchLatest();
+        {
+            std::lock_guard<std::mutex> lock(g_upLock);
+            if (!rel.ok) {
+                g_up.state = UpState::Failed;
+                g_up.message = rel.error;
+            } else {
+                const bool newer = aero::update::IsNewer(aero::update::ParseVersion(rel.tag), aero::update::ParseVersion(aero::kAppVersion));
+                g_up.release = rel;
+                g_up.state = newer ? UpState::Available : UpState::UpToDate;
+            }
+        }
+        PostMessageW(hwnd, kMsgUpdate, 1, 0);
+    }).detach();
+}
+
+void StartInstallerDownload() {
+    aero::update::Release rel;
+    {
+        std::lock_guard<std::mutex> lock(g_upLock);
+        if (g_up.state != UpState::Available) return;
+        g_up.state = UpState::Downloading;
+        rel = g_up.release;
+    }
+    const HWND hwnd = g_hwnd;
+    std::thread([hwnd, rel] {
+        std::wstring error;
+        const bool ok = aero::update::Download(rel, UpdateInstallerPath(), error);
+        {
+            std::lock_guard<std::mutex> lock(g_upLock);
+            g_up.state = UpState::Available;  // a failed download can be retried with the same button
+            g_up.message = error;
+        }
+        PostMessageW(hwnd, kMsgUpdate, 2, ok ? 1 : 0);
+    }).detach();
+}
+
+// Starts the downloaded installer (after a short pause, so this process has exited and its exe is not locked) and closes the hub.
+bool LaunchInstallerAndQuit() {
+    const std::wstring path = UpdateInstallerPath().wstring();
+    std::wstring cmd;
+    DWORD flags = 0;
+    if (path.find_first_of(L"%^&!\"") == std::wstring::npos) {
+        cmd = L"cmd.exe /d /s /c \"ping -n 3 127.0.0.1 >nul & \"" + path + L"\"\"";
+        flags = CREATE_NO_WINDOW;
+    } else {
+        cmd = L"\"" + path + L"\"";
+    }
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (!CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, FALSE, flags | DETACHED_PROCESS, nullptr, nullptr, &si, &pi)) {
+        Log(L"Update: cannot start the installer (error " + std::to_wstring(GetLastError()) + L")");
+        return false;
+    }
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    DestroyWindow(g_hwnd);
+    return true;
+}
+
+void DoUpdate() {
+    const UpState st = UpdateNow();
+    if (st == UpState::Idle || st == UpState::UpToDate || st == UpState::Failed) {
+        StartVersionCheck();
+        return;
+    }
+    if (st != UpState::Available) return;
+    for (const Status& s : g_status) {
+        if (s.level == Level::Active) {
+            MessageBoxW(g_hwnd, Tr(L"The game is running with the module loaded. Close the game first: the update replaces the module file.",
+                           L"Игра запущена с загруженным модулем. Сначала закройте игру: обновление заменяет файл модуля."),
+                        Tr(L"Update AeroHub", L"Обновление AeroHub"), MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+    }
+    std::wstring tag;
+    {
+        std::lock_guard<std::mutex> lock(g_upLock);
+        tag = g_up.release.tag;
+    }
+    std::wstring text = std::wstring(Tr(L"Install AeroHub ", L"Установить AeroHub ")) + tag + L"?\n\n" +
+                        Tr(L"The hub downloads the installer (SHA-256 is checked), closes, and the installer replaces the program files. "
+                           L"Your settings, key binds and panel positions are kept. Start AeroHub again from the Start menu afterwards.",
+                           L"Хаб скачает установщик (проверяется SHA-256), закроется, и установщик заменит файлы программы. "
+                           L"Настройки, бинды и позиции панелей сохранятся. После этого запустите AeroHub снова из меню «Пуск».");
+    wchar_t local[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"LOCALAPPDATA", local, static_cast<DWORD>(std::size(local))) > 0) {
+        const std::filesystem::path installDir = std::filesystem::path(local) / L"Programs" / L"AeroHub";
+        std::error_code ec;
+        if (!std::filesystem::equivalent(installDir, g_dir, ec))
+            text += std::wstring(L"\n\n") + Tr(L"Note: this copy runs from ", L"Внимание: эта копия запущена из ") + g_dir.wstring() +
+                    Tr(L"; the update installs to ", L"; обновление устанавливается в ") + installDir.wstring() + L".";
+    }
+    if (MessageBoxW(g_hwnd, text.c_str(), Tr(L"Update AeroHub", L"Обновление AeroHub"), MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+    Log(L"Update: downloading " + tag + L" ...");
+    StartInstallerDownload();
+}
+
+void OnUpdateMessage(WPARAM stage, LPARAM ok) {
+    std::wstring tag, message;
+    UpState st;
+    {
+        std::lock_guard<std::mutex> lock(g_upLock);
+        st = g_up.state;
+        tag = g_up.release.tag;
+        message = g_up.message;
+    }
+    if (stage == 1) {
+        if (st == UpState::Available) Log(L"Update available: " + tag + L" (this is v" + aero::kAppVersion + L")");
+        else if (st == UpState::UpToDate) Log(L"AeroHub is up to date (v" + std::wstring(aero::kAppVersion) + L")");
+        else if (st == UpState::Failed) Log(L"Update check failed: " + message);
+    } else if (stage == 2) {
+        if (ok) {
+            Log(L"Update: " + tag + L" downloaded and verified, starting the installer");
+            if (!LaunchInstallerAndQuit()) MessageBoxW(g_hwnd, Tr(L"Could not start the installer.", L"Не удалось запустить установщик."), Tr(L"Update AeroHub", L"Обновление AeroHub"), MB_OK | MB_ICONERROR);
+        } else {
+            Log(L"Update: download failed: " + message);
+            MessageBoxW(g_hwnd, (std::wstring(Tr(L"The update could not be downloaded:\n", L"Не удалось скачать обновление:\n")) + message).c_str(),
+                        Tr(L"Update AeroHub", L"Обновление AeroHub"), MB_OK | MB_ICONERROR);
+        }
+    }
+    InvalidateRect(g_hwnd, nullptr, FALSE);
+}
 
 double ProcessAgeSeconds(DWORD pid) {
     aero::UniqueHandle h(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
@@ -211,14 +379,14 @@ Status EvaluateMinecraft(const aero::GameProfile& p) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(jar, ec)) {
         s.level = Level::Bad;
-        s.word = L"Jar missing";
-        s.text = L"aeroclient.jar is missing next to the hub";
+        s.word = Tr(L"Jar missing", L"Нет jar");
+        s.text = Tr(L"aeroclient.jar is missing next to the hub", L"aeroclient.jar не найден рядом с хабом");
         return s;
     }
     if (!g_mc.found) {
         s.level = g_mc.waiting ? Level::Ready : Level::Idle;
-        s.word = g_mc.waiting ? L"Waiting" : L"Not detected";
-        s.text = g_mc.message.empty() ? L"Press Auto-detect Minecraft" : g_mc.message;
+        s.word = g_mc.waiting ? Tr(L"Waiting", L"Ожидание") : Tr(L"Not detected", L"Не найден");
+        s.text = g_mc.message.empty() ? Tr(L"Press Auto-detect Minecraft", L"Нажмите «Найти Minecraft»") : g_mc.message;
         return s;
     }
     const aero::mc::Live live = aero::mc::ReadLive(g_mc.game.dir);
@@ -235,36 +403,36 @@ Status EvaluateMinecraft(const aero::GameProfile& p) {
     s.pid = reporting ? live.pid : runPid;
     if (reporting) {
         s.level = Level::Active;
-        s.text = L"AeroClient is loaded in the running game";
+        s.text = Tr(L"AeroClient is loaded in the running game", L"AeroClient загружен в запущенной игре");
         return s;
     }
     const bool hasMod = aero::mc::HasMod(g_mc.game.dir);
     if (runPid != 0) {
         if (!compatible) {
             s.level = Level::Ready;
-            s.word = L"Not Fabric " + p.gameVersion;
-            s.text = L"This game is not Fabric " + p.gameVersion + L": the mod will not load";
+            s.word = std::wstring(Tr(L"Not Fabric ", L"Не Fabric ")) + p.gameVersion;
+            s.text = std::wstring(Tr(L"This game is not Fabric ", L"Эта игра не Fabric ")) + p.gameVersion + Tr(L": the mod will not load", L": мод не загрузится");
         } else if (!hasMod) {
             s.level = Level::Ready;
-            s.word = L"No mod";
-            s.text = L"Running without the mod: add it, then restart";
+            s.word = Tr(L"No mod", L"Нет мода");
+            s.text = Tr(L"Running without the mod: add it, then restart", L"Игра запущена без мода: добавьте его и перезапустите");
         } else if (ProcessAgeSeconds(runPid) < 120.0) {
-            s.word = L"Starting";
-            s.text = L"The game is starting";
+            s.word = Tr(L"Starting", L"Запуск");
+            s.text = Tr(L"The game is starting", L"Игра запускается");
         } else {
             s.level = Level::Ready;
-            s.word = L"Restart needed";
-            s.text = L"The mod is in the mods folder but not loaded: restart";
+            s.word = Tr(L"Restart needed", L"Нужен перезапуск");
+            s.text = Tr(L"The mod is in the mods folder but not loaded: restart", L"Мод в папке mods, но не загружен: перезапустите игру");
         }
         return s;
     }
     if (hasMod) {
-        s.word = L"Mod added";
-        s.text = L"The mod is in the mods folder: start Minecraft";
+        s.word = Tr(L"Mod added", L"Мод добавлен");
+        s.text = Tr(L"The mod is in the mods folder: start Minecraft", L"Мод в папке mods: запустите Minecraft");
     } else {
         s.level = Level::Ready;
-        s.word = L"No mod";
-        s.text = L"Install the mod and drop it into the mods folder";
+        s.word = Tr(L"No mod", L"Нет мода");
+        s.text = Tr(L"Install the mod and drop it into the mods folder", L"Установите мод и положите его в папку mods");
     }
     return s;
 }
@@ -276,42 +444,42 @@ Status Evaluate(const aero::GameProfile& p) {
     std::error_code ec;
     if (!std::filesystem::is_regular_file(dll, ec)) {
         s.level = Level::Bad;
-        s.text = L"Module DLL missing: " + dll.wstring();
+        s.text = std::wstring(Tr(L"Module DLL missing: ", L"Не найден файл модуля: ")) + dll.wstring();
         return s;
     }
     const auto pid = aero::FindProcessId(p.processName);
     if (!pid) {
-        s.text = L"The game is not running.";
+        s.text = Tr(L"The game is not running.", L"Игра не запущена.");
         return s;
     }
     s.pid = *pid;
     aero::UniqueHandle proc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, *pid));
     if (!proc) {
         s.level = Level::Bad;
-        s.text = L"Cannot open the game process. Run the hub as the same user as the game.";
+        s.text = Tr(L"Cannot open the game process. Run the hub as the same user as the game.", L"Не удаётся открыть процесс игры. Запустите хаб от того же пользователя, что и игру.");
         return s;
     }
     const auto base = aero::FindModuleBase(*pid, p.processName);
     const auto id = base ? aero::ReadImageIdentity(proc.get(), *base) : std::nullopt;
     if (!id) {
         s.level = Level::Bad;
-        s.text = L"Cannot read the game's PE header.";
+        s.text = Tr(L"Cannot read the game's PE header.", L"Не удаётся прочитать PE-заголовок игры.");
         return s;
     }
     if (id->timeDateStamp != p.timeDateStamp || id->sizeOfImage != p.sizeOfImage) {
         s.level = Level::Bad;
-        s.text = L"Unsupported game build: stamp " + Hex(id->timeDateStamp) + L", size " + Hex(id->sizeOfImage) +
-                 L" (profile expects " + Hex(p.timeDateStamp) + L" / " + Hex(p.sizeOfImage) + L").";
+        s.text = std::wstring(Tr(L"Unsupported game build: stamp ", L"Неподдерживаемая версия игры: штамп ")) + Hex(id->timeDateStamp) + Tr(L", size ", L", размер ") +
+                 Hex(id->sizeOfImage) + Tr(L" (profile expects ", L" (профиль ожидает ") + Hex(p.timeDateStamp) + L" / " + Hex(p.sizeOfImage) + L").";
         return s;
     }
-    const std::wstring build = L"Build matches the profile (" + Hex(p.timeDateStamp) + L" / " + Hex(p.sizeOfImage) + L").";
+    const std::wstring build = std::wstring(Tr(L"Build matches the profile (", L"Версия совпадает с профилем (")) + Hex(p.timeDateStamp) + L" / " + Hex(p.sizeOfImage) + L").";
     if (aero::FindModuleBase(*pid, dll.filename().wstring())) {
         s.level = Level::Active;
-        s.text = build + L" Module loaded.";
+        s.text = build + Tr(L" Module loaded.", L" Модуль загружен.");
         return s;
     }
     s.level = Level::Ready;
-    s.text = build + L" Module not loaded yet.";
+    s.text = build + Tr(L" Module not loaded yet.", L" Модуль ещё не загружен.");
     s.canInject = true;
     return s;
 }
@@ -323,7 +491,7 @@ void Redraw() { InvalidateRect(g_hwnd, nullptr, FALSE); }
 void FillDemoData() {
     g_infoRows = {{L"Game state", L"in match"}, {L"Local team", L"1"}, {L"Resource A (team +0x58)", L"unlimited"},
                   {L"Resource B (team +0x50)", L"unlimited"}, {L"Own weapons", L"5"}};
-    g_link = {L"Live", Level::Active};
+    g_link = {Tr(L"Live", L"Онлайн"), Level::Active};
 }
 
 // Keeps g_client attached to the selected game's running process and mirrors its features / telemetry.
@@ -337,18 +505,18 @@ void UpdateChannel() {
         g_client.Close();
         g_clientPid = 0;
         g_infoRows.clear();
-        g_link = {L"Offline", Level::Idle};
+        g_link = {Tr(L"Offline", L"Не в сети"), Level::Idle};
         if (g_mc.found) {
             const aero::mc::Live live = aero::mc::ReadLive(g_mc.game.dir);
             if (live.fresh) {
-                g_link = {L"Live", Level::Active};
+                g_link = {Tr(L"Live", L"Онлайн"), Level::Active};
                 for (const auto& [k, v] : live.rows) g_infoRows.push_back({k, v});
             }
         }
         return;
     }
     const bool active = sel >= 0 && g_status[sel].level == Level::Active;
-    g_link = {L"Offline", Level::Idle};
+    g_link = {Tr(L"Offline", L"Не в сети"), Level::Idle};
 
     if (!active) {
         g_client.Close();
@@ -366,12 +534,12 @@ void UpdateChannel() {
             }
         }
         if (!g_client.Connected()) {
-            g_link = {L"No channel", Level::Bad};
+            g_link = {Tr(L"No channel", L"Нет канала"), Level::Bad};
         } else {
             const LONG beat = g_client.View()->heartbeat;
             g_staleTicks = (beat == g_lastBeat) ? g_staleTicks + 1 : 0;
             g_lastBeat = beat;
-            g_link = g_staleTicks >= kStaleTicksBeforeWarning ? Link{L"No frames", Level::Ready} : Link{L"Live", Level::Active};
+            g_link = g_staleTicks >= kStaleTicksBeforeWarning ? Link{Tr(L"No frames", L"Нет кадров"), Level::Ready} : Link{Tr(L"Live", L"Онлайн"), Level::Active};
         }
     }
 
@@ -443,7 +611,7 @@ void AutoDetect() {
     }
     g_mc.found = false;
     g_mc.waiting = true;
-    g_mc.message = L"Not found: start Minecraft, the hub will find it";
+    g_mc.message = Tr(L"Not found: start Minecraft, the hub will find it", L"Не найден: запустите Minecraft, хаб найдёт его");
     Log(L"Minecraft: nothing found in the Modrinth App, TLauncher or .minecraft. Start Minecraft and the hub will find it through its process.");
 }
 
@@ -508,15 +676,18 @@ void DoSwitchOpenGl() {
     if (g_gfx.file.empty()) return;
     const bool vulkan = g_gfx.state == aero::diag::GraphicsState::Vulkan;
     const std::wstring text =
-        (vulkan ? L"Forts is set to Vulkan, and the AeroHub module only works with OpenGL.\n\nSet EnableVulkan = false in\n"
-                : L"The Forts settings file has no EnableVulkan entry, so the game picks the graphics API itself. The AeroHub module only works with OpenGL.\n\nAdd EnableVulkan = false to\n") +
+        std::wstring(vulkan ? Tr(L"Forts is set to Vulkan, and the AeroHub module only works with OpenGL.\n\nSet EnableVulkan = false in\n",
+                                 L"Forts настроен на Vulkan, а модуль AeroHub работает только с OpenGL.\n\nЗадайте EnableVulkan = false в файле\n")
+                            : Tr(L"The Forts settings file has no EnableVulkan entry, so the game picks the graphics API itself. The AeroHub module only works with OpenGL.\n\nAdd EnableVulkan = false to\n",
+                                 L"В файле настроек Forts нет записи EnableVulkan, поэтому игра сама выбирает графический API. Модуль AeroHub работает только с OpenGL.\n\nДобавьте EnableVulkan = false в файл\n")) +
         g_gfx.file.wstring() +
-        L"\n\nA backup copy (settings_hardware.lua.aerohub-bak) is kept next to it. Forts must be closed; the change applies the next time the game starts.";
-    if (MessageBoxW(g_hwnd, text.c_str(), L"Switch to OpenGL", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        Tr(L"\n\nA backup copy (settings_hardware.lua.aerohub-bak) is kept next to it. Forts must be closed; the change applies the next time the game starts.",
+           L"\n\nРезервная копия (settings_hardware.lua.aerohub-bak) останется рядом. Forts должен быть закрыт; изменение применится при следующем запуске игры.");
+    if (MessageBoxW(g_hwnd, text.c_str(), Tr(L"Switch to OpenGL", L"Переключить на OpenGL"), MB_YESNO | MB_ICONQUESTION) != IDYES) return;
     const std::wstring err = aero::diag::SwitchToOpenGl(g_gfx.file);
     if (!err.empty()) {
         Log(L"Switch to OpenGL failed: " + err);
-        MessageBoxW(g_hwnd, err.c_str(), L"Switch to OpenGL", MB_OK | MB_ICONWARNING);
+        MessageBoxW(g_hwnd, err.c_str(), Tr(L"Switch to OpenGL", L"Переключить на OpenGL"), MB_OK | MB_ICONWARNING);
         return;
     }
     Log(L"Forts is now set to OpenGL (EnableVulkan = false). Backup: " + g_gfx.file.wstring() + L".aerohub-bak. Start the game to apply it.");
@@ -532,9 +703,11 @@ void DoCollectLogs() {
     }
     const int answer = MessageBoxW(
         g_hwnd,
-        L"AeroHub will pack the Forts game log, the newest desync reports, the AeroHub module log and a short summary into one zip file on your Desktop.\n\n"
-        L"The files contain your Windows user name (in file paths) and your Steam name and ID. Nothing is uploaded: you send the zip yourself.\n\nCreate the zip?",
-        L"Collect logs", MB_YESNO | MB_ICONQUESTION);
+        Tr(L"AeroHub will pack the Forts game log, the newest desync reports, the AeroHub module log and a short summary into one zip file on your Desktop.\n\n"
+           L"The files contain your Windows user name (in file paths) and your Steam name and ID. Nothing is uploaded: you send the zip yourself.\n\nCreate the zip?",
+           L"AeroHub упакует лог игры Forts, последние отчёты о рассинхронизации, лог модуля AeroHub и краткую сводку в один zip-файл на рабочем столе.\n\n"
+           L"В файлах есть имя пользователя Windows (в путях) и ваше имя и ID в Steam. Ничего не отправляется: файл вы пересылаете сами.\n\nСоздать zip?"),
+        Tr(L"Collect logs", L"Сбор логов"), MB_YESNO | MB_ICONQUESTION);
     if (answer != IDYES) return;
     std::filesystem::path outDir = g_dir;
     PWSTR desktop = nullptr;
@@ -549,7 +722,7 @@ void DoCollectLogs() {
     SetCursor(previous);
     if (!r.error.empty()) {
         Log(L"Collect logs failed: " + r.error);
-        MessageBoxW(g_hwnd, (L"Could not create the zip:\n" + r.error).c_str(), L"Collect logs", MB_OK | MB_ICONERROR);
+        MessageBoxW(g_hwnd, (std::wstring(Tr(L"Could not create the zip:\n", L"Не удалось создать zip:\n")) + r.error).c_str(), Tr(L"Collect logs", L"Сбор логов"), MB_OK | MB_ICONERROR);
         return;
     }
     Log(L"Logs packed into " + r.zip.wstring() + L" (" + std::to_wstring(r.files.size()) + L" files). Send this file.");
@@ -599,13 +772,13 @@ struct PrimaryState {
 
 PrimaryState GetPrimary() {
     const int sel = SelectedProfile();
-    if (sel < 0) return {L"No game", false};
+    if (sel < 0) return {Tr(L"No game", L"Нет игры"), false};
     const Status& s = g_status[sel];
-    if (g_profiles[sel].kind == aero::GameKind::FabricMod) return {L"Auto-detect Minecraft", true};
-    if (s.canInject) return {L"Inject module", true};
-    if (s.level == Level::Idle && s.pid == 0 && !g_profiles[sel].steamAppId.empty()) return {L"Launch game", true};
-    if (s.level == Level::Active) return {L"Module active", false};
-    return {L"Unavailable", false};
+    if (g_profiles[sel].kind == aero::GameKind::FabricMod) return {Tr(L"Auto-detect Minecraft", L"Найти Minecraft"), true};
+    if (s.canInject) return {Tr(L"Inject module", L"Внедрить модуль"), true};
+    if (s.level == Level::Idle && s.pid == 0 && !g_profiles[sel].steamAppId.empty()) return {Tr(L"Launch game", L"Запустить игру"), true};
+    if (s.level == Level::Active) return {Tr(L"Module active", L"Модуль активен"), false};
+    return {Tr(L"Unavailable", L"Недоступно"), false};
 }
 
 void DoSecondary() {
@@ -796,9 +969,43 @@ void DrawSidebar(Gdiplus::Graphics& g, const Lay& L) {
     FillRR(g, RectF(x, y, S(36), S(36)), S(10), kAccent);
     DrawStr(g, L"A", *g_fBrand, RectF(x, y, S(36), S(36)), RGB(255, 255, 255), Gdiplus::StringAlignmentCenter);
     DrawStr(g, L"AeroHub", *g_fH2, RectF(x + S(48), y - S(2), S(150), S(22)), kText);
-    DrawStr(g, L"Game tool hub", *g_fSmall, RectF(x + S(48), y + S(18), S(150), S(18)), kDim);
-    y += S(64);
-    DrawStr(g, L"GAMES", *g_fSmall, RectF(x, y, S(120), S(18)), kDim);
+    DrawStr(g, Tr(L"Game tool hub", L"Хаб для игр"), *g_fSmall, RectF(x + S(48), y + S(18), S(150), S(18)), kDim);
+
+    // Version and the update button next to it.
+    {
+        const float vy = y + S(52);
+        DrawStr(g, std::wstring(Tr(L"Version ", L"Версия ")) + aero::kAppVersion, *g_fSmall, RectF(x, vy + S(5), S(96), S(18)), kDim);
+        std::wstring label = Tr(L"Check updates", L"Обновления");
+        bool primary = false, enabled = !g_demo;
+        switch (UpdateNow()) {
+            case UpState::Checking: label = Tr(L"Checking...", L"Проверка..."); enabled = false; break;
+            case UpState::UpToDate: label = Tr(L"Up to date", L"Последняя"); break;
+            case UpState::Available: {
+                std::lock_guard<std::mutex> lock(g_upLock);
+                label = std::wstring(Tr(L"Update ", L"Обновить ")) + g_up.release.tag;
+                primary = true;
+                break;
+            }
+            case UpState::Downloading: label = Tr(L"Downloading...", L"Загрузка..."); enabled = false; break;
+            case UpState::Failed: label = Tr(L"Retry check", L"Повторить"); break;
+            case UpState::Idle: break;
+        }
+        const RectF btn(L.sidebar.Width - S(20) - S(124), vy, S(124), S(28));
+        DrawButton(g, btn, label, primary, enabled, IsHover(Act::Update, 0), IsPressed(Act::Update, 0));
+        AddHit(Act::Update, 0, btn, enabled);
+
+        // Interface language: two segments, the active one is filled.
+        const float ly = vy + S(40);
+        DrawStr(g, Tr(L"Language", L"Язык"), *g_fSmall, RectF(x, ly + S(5), S(96), S(18)), kDim);
+        const float seg = S(60);
+        const RectF en(L.sidebar.Width - S(20) - 2 * seg - S(4), ly, seg, S(28)), ru(L.sidebar.Width - S(20) - seg, ly, seg, S(28));
+        DrawButton(g, en, L"EN", g_lang == 0, true, IsHover(Act::LangEn, 0), IsPressed(Act::LangEn, 0));
+        DrawButton(g, ru, L"RU", g_lang == 1, true, IsHover(Act::LangRu, 0), IsPressed(Act::LangRu, 0));
+        AddHit(Act::LangEn, 0, en);
+        AddHit(Act::LangRu, 0, ru);
+    }
+    y += S(146);
+    DrawStr(g, Tr(L"GAMES", L"ИГРЫ"), *g_fSmall, RectF(x, y, S(120), S(18)), kDim);
     y += S(26);
 
     for (std::size_t i = 0; i < g_profiles.size(); ++i) {
@@ -819,9 +1026,9 @@ void DrawSidebar(Gdiplus::Graphics& g, const Lay& L) {
     const float by = L.sidebar.Height - S(104);
     Gdiplus::Pen div(Col(kBorder), 1.0f);
     g.DrawLine(&div, S(20), by, L.sidebar.Width - S(20), by);
-    DrawStr(g, L"Auto-inject", *g_fBodyBold, RectF(x, by + S(14), S(150), S(22)), kText);
-    DrawStr(g, L"Loads the module a few seconds", *g_fSmall, RectF(x, by + S(36), S(190), S(18)), kDim);
-    DrawStr(g, L"after the game starts", *g_fSmall, RectF(x, by + S(52), S(190), S(18)), kDim);
+    DrawStr(g, Tr(L"Auto-inject", L"Автовнедрение"), *g_fBodyBold, RectF(x, by + S(14), S(150), S(22)), kText);
+    DrawStr(g, Tr(L"Loads the module a few seconds", L"Загрузит модуль через"), *g_fSmall, RectF(x, by + S(36), S(190), S(18)), kDim);
+    DrawStr(g, Tr(L"after the game starts", L"несколько секунд после старта"), *g_fSmall, RectF(x, by + S(52), S(190), S(18)), kDim);
     const RectF sw(L.sidebar.Width - S(20) - S(44), by + S(16), S(44), S(24));
     DrawSwitch(g, sw, g_autoInject, true, IsHover(Act::AutoSwitch, 0));
     AddHit(Act::AutoSwitch, 0, RectF(x, by + S(8), L.sidebar.Width - 2 * x, S(70)));
@@ -831,8 +1038,8 @@ void DrawHeader(Gdiplus::Graphics& g, const Lay& L) {
     const RectF& h = L.header;
     const int sel = SelectedProfile();
     if (sel < 0) {
-        DrawStr(g, L"No game profiles", *g_fTitle, RectF(h.X, h.Y, h.Width, S(36)), kText);
-        DrawStr(g, L"Add a profile .ini to the profiles folder next to the hub.", *g_fBody, RectF(h.X, h.Y + S(40), h.Width, S(24)), kDim);
+        DrawStr(g, Tr(L"No game profiles", L"Нет профилей игр"), *g_fTitle, RectF(h.X, h.Y, h.Width, S(36)), kText);
+        DrawStr(g, Tr(L"Add a profile .ini to the profiles folder next to the hub.", L"Добавьте профиль .ini в папку profiles рядом с хабом."), *g_fBody, RectF(h.X, h.Y + S(40), h.Width, S(24)), kDim);
         return;
     }
     const Status& st = g_status[sel];
@@ -846,7 +1053,7 @@ void DrawHeader(Gdiplus::Graphics& g, const Lay& L) {
         const RectF install(h.X + h.Width - S(150), h.Y + S(2), S(150), bh);
         const RectF detect(install.X - S(12) - S(210), h.Y + S(2), S(210), bh);
         DrawButton(g, detect, prim.label, true, prim.enabled, IsHover(Act::Primary, 0), IsPressed(Act::Primary, 0));
-        DrawButton(g, install, L"Install mod", false, true, IsHover(Act::Secondary, 0), IsPressed(Act::Secondary, 0));
+        DrawButton(g, install, Tr(L"Install mod", L"Установить мод"), false, true, IsHover(Act::Secondary, 0), IsPressed(Act::Secondary, 0));
         AddHit(Act::Primary, 0, detect, prim.enabled);
         AddHit(Act::Secondary, 0, install);
         leftmost = detect.X;
@@ -854,13 +1061,13 @@ void DrawHeader(Gdiplus::Graphics& g, const Lay& L) {
         const RectF refresh(h.X + h.Width - S(96), h.Y + S(2), S(96), bh);
         const RectF primary(refresh.X - S(12) - S(176), h.Y + S(2), S(176), bh);
         DrawButton(g, primary, prim.label, true, prim.enabled, IsHover(Act::Primary, 0), IsPressed(Act::Primary, 0));
-        DrawButton(g, refresh, L"Refresh", false, true, IsHover(Act::Refresh, 0), IsPressed(Act::Refresh, 0));
+        DrawButton(g, refresh, Tr(L"Refresh", L"Обновить"), false, true, IsHover(Act::Refresh, 0), IsPressed(Act::Refresh, 0));
         AddHit(Act::Primary, 0, primary, prim.enabled);
         AddHit(Act::Refresh, 0, refresh);
         leftmost = primary.X;
         if (IsForts(g_profiles[sel])) {
             const RectF logs(primary.X - S(12) - S(150), h.Y + S(2), S(150), bh);
-            DrawButton(g, logs, L"Collect logs", false, true, IsHover(Act::CollectLogs, 0), IsPressed(Act::CollectLogs, 0));
+            DrawButton(g, logs, Tr(L"Collect logs", L"Собрать логи"), false, true, IsHover(Act::CollectLogs, 0), IsPressed(Act::CollectLogs, 0));
             AddHit(Act::CollectLogs, 0, logs);
             leftmost = logs.X;
         }
@@ -875,15 +1082,15 @@ void DrawHeader(Gdiplus::Graphics& g, const Lay& L) {
 void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
     const RectF& c = L.guide;
     DrawCard(g, c);
-    DrawStr(g, L"In-game menu", *g_fH2, RectF(c.X + S(20), c.Y + S(14), c.Width - S(40), S(24)), kText);
+    DrawStr(g, Tr(L"In-game menu", L"Меню в игре"), *g_fH2, RectF(c.X + S(20), c.Y + S(14), c.Width - S(40), S(24)), kText);
     const int sel = SelectedProfile();
     const bool active = sel >= 0 && g_status[sel].level == Level::Active;
     const bool minecraft = sel >= 0 && g_profiles[sel].kind == aero::GameKind::FabricMod;
-    const std::wstring lead = minecraft ? (active ? L"AeroClient is loaded. Everything is switched in the game itself."
-                                          : g_mc.found ? L"Install the mod, drop it into the mods folder and start the game."
-                                                       : L"Press Auto-detect Minecraft. If it finds nothing, start the game.")
-                              : active   ? L"Cheats are switched in the game itself. Open its menu during a match."
-                                         : L"Launch the game and load the module; cheats are then switched in the game's own menu.";
+    const std::wstring lead = minecraft ? (active ? Tr(L"AeroClient is loaded. Everything is switched in the game itself.", L"AeroClient загружен. Всё переключается в игре.")
+                                          : g_mc.found ? Tr(L"Install the mod, drop it into the mods folder and start the game.", L"Установите мод, положите в папку mods и запустите игру.")
+                                                       : Tr(L"Press Auto-detect Minecraft. If it finds nothing, start the game.", L"Нажмите «Найти Minecraft», иначе запустите игру."))
+                              : active   ? Tr(L"Cheats are switched in the game itself. Open its menu during a match.", L"Функции включаются в самой игре: откройте её меню.")
+                                         : Tr(L"Launch the game and load the module; cheats are then switched in the game's own menu.", L"Запустите игру и модуль, функции включаются в игре.");
     // The module hooks OpenGL's SwapBuffers, so a Forts set to Vulkan never shows the menu: say so and offer the fix.
     float shift = 0;
     if (sel >= 0 && IsForts(g_profiles[sel]) &&
@@ -894,9 +1101,9 @@ void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
         StrokeRR(g, strip, S(8), kWarn, 1.0f, 150);
         const RectF btn(strip.X + strip.Width - S(160) - S(6), strip.Y + S(6), S(160), strip.Height - S(12));
         const bool vulkan = g_gfx.state == aero::diag::GraphicsState::Vulkan;
-        DrawStr(g, vulkan ? L"Forts is on Vulkan: needs OpenGL" : L"Graphics API not set: needs OpenGL", *g_fSmall,
+        DrawStr(g, vulkan ? Tr(L"Forts is on Vulkan: needs OpenGL", L"Forts на Vulkan: нужен OpenGL") : Tr(L"Graphics API not set: needs OpenGL", L"Графический API не задан: нужен OpenGL"), *g_fSmall,
                 RectF(strip.X + S(14), strip.Y, strip.Width - btn.Width - S(30), strip.Height), kText);
-        DrawButton(g, btn, L"Switch to OpenGL", true, true, IsHover(Act::SwitchOpenGl, 0), IsPressed(Act::SwitchOpenGl, 0));
+        DrawButton(g, btn, Tr(L"Switch to OpenGL", L"На OpenGL"), true, true, IsHover(Act::SwitchOpenGl, 0), IsPressed(Act::SwitchOpenGl, 0));
         AddHit(Act::SwitchOpenGl, 0, btn);
     }
     DrawStr(g, lead, *g_fBody, RectF(c.X + S(20), c.Y + S(50) + shift, c.Width - S(40), S(24)), kText);
@@ -904,11 +1111,26 @@ void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
     if (sel < 0) return;
     // One line per "|"-separated hint. The Minecraft tab starts with what it knows about the game and the mod file.
     std::wstring hk = g_profiles[sel].hotkeys;
+    if (g_lang == 1) {
+        static const std::pair<const wchar_t*, const wchar_t*> kHints[] = {
+            {L"Insert = open the cheat menu (click rows, or use the arrow keys)", L"Insert = открыть меню читов (клик по строкам или стрелки)"},
+            {L"F6 = unlimited resources on / off", L"F6 = бесконечные ресурсы вкл / выкл"},
+            {L"End = everything off", L"End = всё выключить"},
+            {L"Right Shift or Insert = open the module menu", L"Right Shift или Insert = открыть меню модуля"},
+            {L".mine diamond_ore = auto-mine an ore", L".mine diamond_ore = автодобыча руды"},
+            {L".help = chat commands", L".help = команды чата"}};
+        for (const auto& h : kHints) {
+            const std::size_t at = hk.find(h.first);
+            if (at != std::wstring::npos) hk.replace(at, wcslen(h.first), h.second);
+        }
+    }
     if (minecraft) {
-        std::wstring info = g_mc.found ? L"Game: " + GameLabel(g_mc.game) + L"  |  Folder: " + g_mc.game.dir.wstring() + L"  |  Mod: " +
-                                             (aero::mc::HasMod(g_mc.game.dir) ? L"in the mods folder" : L"not in the mods folder yet")
-                                       : std::wstring(L"Game: not detected yet");
-        info += L"  |  Mod file: " + (g_mc.savedJar.empty() ? std::wstring(L"press Install mod to put it in Downloads") : g_mc.savedJar.wstring());
+        std::wstring info = g_mc.found ? std::wstring(Tr(L"Game: ", L"Игра: ")) + GameLabel(g_mc.game) + Tr(L"  |  Folder: ", L"  |  Папка: ") + g_mc.game.dir.wstring() +
+                                             Tr(L"  |  Mod: ", L"  |  Мод: ") +
+                                             (aero::mc::HasMod(g_mc.game.dir) ? Tr(L"in the mods folder", L"в папке mods") : Tr(L"not in the mods folder yet", L"ещё не в папке mods"))
+                                       : std::wstring(Tr(L"Game: not detected yet", L"Игра: ещё не найдена"));
+        info += std::wstring(Tr(L"  |  Mod file: ", L"  |  Файл мода: ")) +
+                (g_mc.savedJar.empty() ? std::wstring(Tr(L"press Install mod to put it in Downloads", L"нажмите «Установить мод», файл попадёт в Загрузки")) : g_mc.savedJar.wstring());
         hk = info + (hk.empty() ? L"" : L"  |  " + hk);
     }
     if (hk.empty()) return;
@@ -934,14 +1156,14 @@ void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
 void DrawLive(Gdiplus::Graphics& g, const Lay& L) {
     const RectF& c = L.live;
     DrawCard(g, c);
-    DrawStr(g, L"Live info", *g_fH2, RectF(c.X + S(20), c.Y + S(14), c.Width - S(160), S(24)), kText);
+    DrawStr(g, Tr(L"Live info", L"Данные игры"), *g_fH2, RectF(c.X + S(20), c.Y + S(14), c.Width - S(160), S(24)), kText);
     // Link pill on the right.
     {
         const float w = S(26) + S(8) * 2 + MeasureW(g, g_link.text, *g_fSmall) + S(8);
         DrawPill(g, c.X + c.Width - S(20) - w, c.Y + S(13), g_link.text, LevelColor(g_link.level));
     }
     if (g_infoRows.empty()) {
-        DrawEmptyState(g, RectF(c.X, c.Y + S(40), c.Width, c.Height - S(40)), L"No live data", L"Values appear while the module is active in a match.");
+        DrawEmptyState(g, RectF(c.X, c.Y + S(40), c.Width, c.Height - S(40)), Tr(L"No live data", L"Нет данных"), Tr(L"Values appear while the module is active in a match.", L"Значения появятся, пока модуль активен в матче."));
         return;
     }
     float y = c.Y + S(52);
@@ -968,9 +1190,9 @@ void DrawLog(Gdiplus::Graphics& g, const Lay& L) {
         DrawStr(g, text, *g_fSmall, r, active ? kText : kDim, Gdiplus::StringAlignmentCenter);
         AddHit(act, 0, r);
     };
-    drawTab(tab1, L"Module log", g_tab == 0, Act::TabModule);
-    drawTab(tab2, L"Hub log", g_tab == 1, Act::TabHub);
-    DrawStr(g, L"live", *g_fSmall, RectF(L.log.X + L.log.Width - S(70), L.log.Y + S(12), S(54), S(32)), kDim, Gdiplus::StringAlignmentFar);
+    drawTab(tab1, Tr(L"Module log", L"Лог модуля"), g_tab == 0, Act::TabModule);
+    drawTab(tab2, Tr(L"Hub log", L"Лог хаба"), g_tab == 1, Act::TabHub);
+    DrawStr(g, Tr(L"live", L"онлайн"), *g_fSmall, RectF(L.log.X + L.log.Width - S(70), L.log.Y + S(12), S(54), S(32)), kDim, Gdiplus::StringAlignmentFar);
     Gdiplus::Pen sep(Col(kBorder), 1.0f);
     g.DrawLine(&sep, L.log.X + S(1), L.log.Y + S(55), L.log.X + L.log.Width - S(1), L.log.Y + S(55));
 }
@@ -1017,6 +1239,14 @@ bool HitAt(int x, int y, Act& act, int& idx, bool& enabled) {
     return false;
 }
 
+// Changing the language rebuilds the texts that were computed from it (statuses and the link pill).
+void SetLanguage(int lang) {
+    if (g_lang == lang) return;
+    g_lang = lang;
+    WritePrivateProfileStringW(L"Hub", L"Language", g_lang == 1 ? L"ru" : L"en", g_settingsFile.c_str());
+    Refresh();
+}
+
 void Perform(Act act, int idx) {
     switch (act) {
         case Act::SelectGame:
@@ -1034,6 +1264,9 @@ void Perform(Act act, int idx) {
         case Act::TabHub: g_tab = 1; PositionLogs(); break;
         case Act::CollectLogs: DoCollectLogs(); break;
         case Act::SwitchOpenGl: DoSwitchOpenGl(); break;
+        case Act::Update: DoUpdate(); break;
+        case Act::LangEn:
+        case Act::LangRu: SetLanguage(act == Act::LangRu ? 1 : 0); break;
         case Act::None: break;
     }
     Redraw();
@@ -1067,6 +1300,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             MakeFonts();
 
             g_autoInject = GetPrivateProfileIntW(L"Hub", L"AutoInject", 0, g_settingsFile.c_str()) != 0;
+            {
+                wchar_t lang[16]{};
+                GetPrivateProfileStringW(L"Hub", L"Language", L"", lang, static_cast<DWORD>(std::size(lang)), g_settingsFile.c_str());
+                g_lang = lang[0] ? (_wcsicmp(lang, L"ru") == 0 ? 1 : 0) : (PRIMARYLANGID(GetUserDefaultUILanguage()) == LANG_RUSSIAN ? 1 : 0);
+            }
             std::vector<std::wstring> errors;
             g_profiles = aero::LoadProfiles(g_dir / L"profiles", errors);
             wchar_t buf[2048]{};
@@ -1085,6 +1323,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (!g_mc.found) AutoDetect();
             Refresh();
             PositionLogs();
+            g_checkUpdates = GetPrivateProfileIntW(L"Hub", L"CheckUpdates", 1, g_settingsFile.c_str()) != 0;
+            Log(std::wstring(L"AeroHub v") + aero::kAppVersion);
+            if (g_checkUpdates) StartVersionCheck();
             SetTimer(hwnd, kTimer, 1000, nullptr);
             return 0;
         }
@@ -1109,6 +1350,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AutoInject();
             PollModuleLog();
             return 0;
+        case kMsgUpdate: OnUpdateMessage(wp, lp); return 0;
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
             PAINTSTRUCT ps;
