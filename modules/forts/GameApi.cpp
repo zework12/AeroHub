@@ -42,6 +42,7 @@ using FnGetDeviceId = int (*)(int, int);
 using FnGetDeviceHp = float (*)(int);
 using FnRepairDevice = void (*)(int);
 using FnUpdateWeaponAim = void (*)(int, const Vec3*);
+using FnFireWeapon = int (*)(int, const Vec3*, float, int);
 using FnSendScriptEvent = void (*)(const char*, const char*, const char*, bool);
 using FnWaterLevel = float (*)(float);
 using FnCastGroundRay = int (*)(const Vec3*, const Vec3*, int);
@@ -152,7 +153,7 @@ bool GameApi::Init(HMODULE exe, std::string& error) {
                                 &cfg::kGetTeamCommanderPoints, &cfg::kAddTeamCommanderPoints, &cfg::kSetOverrideBuildTime,
                                 &cfg::kIsCommanderActive, &cfg::kSetOverrideReloadTime, &cfg::kGetDeviceCount, &cfg::kGetDeviceId,
                                 &cfg::kGetDevicePosition, &cfg::kGetDeviceHitpoints, &cfg::kGetDeviceInitialHitpoints,
-                                &cfg::kRepairDevice, &cfg::kUpdateWeaponAim, &cfg::kSendScriptEvent,
+                                &cfg::kRepairDevice, &cfg::kUpdateWeaponAim, &cfg::kFireWeapon, &cfg::kSendScriptEvent,
                                 &cfg::kGetWaterLevel, &cfg::kCastGroundRay, &cfg::kGetRayHitPosition, &cfg::kIsWeaponReadyToFire,
                                 &cfg::kGetWeaponReloadTime, &cfg::kGetWeaponReloadPeriodById, &cfg::kGetProjectileTypeDrag,
                                 &cfg::kGetLocalSelectedDeviceId, &cfg::kGetMousePos, &cfg::kScreenToWorld}) {
@@ -631,6 +632,18 @@ bool GameApi::SendScriptEvent(const char* function, const char* params) const {
 bool GameApi::AimWeaponAt(int weaponId, const Vec3& target) const {
     return Guard([&] {
         Fn<FnUpdateWeaponAim>(cfg::kUpdateWeaponAim)(weaponId, &target);
+        return true;
+    });
+}
+
+bool GameApi::FireWeaponAt(int weaponId, const Vec3& target, int flags, int& result, int& contextBefore) const {
+    return Guard([&] {
+        // FireWeapon refuses guns whose team is not the current script team unless that is -1; scripts set it, we are not one.
+        volatile int* context = reinterpret_cast<volatile int*>(g_base + cfg::kScriptTeamContextRva);
+        contextBefore = *context;
+        *context = -1;
+        result = Fn<FnFireWeapon>(cfg::kFireWeapon)(weaponId, &target, 0.0f, flags);
+        if (*context == -1) *context = contextBefore;  // a script that changed it meanwhile keeps its value
         return true;
     });
 }

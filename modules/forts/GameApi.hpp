@@ -113,6 +113,9 @@ public:
     bool DeviceHealth(int deviceId, float& hp, float& maxHp) const;
     bool RepairDevice(int deviceId) const;
     bool AimWeaponAt(int weaponId, const Vec3& target) const;
+    // The game's own FireWeapon (aims and fires one gun at a world point). `result` is the raw FIRE_* code the game returns.
+    // `contextBefore` is the game's script team context as found (see cfg::kScriptTeamContextRva).
+    bool FireWeaponAt(int weaponId, const Vec3& target, int flags, int& result, int& contextBefore) const;
     bool SendScriptEvent(const char* function, const char* params) const;
     // Global player aim input (angle, speed).
     bool AimInput(float& angle, float& speed) const;

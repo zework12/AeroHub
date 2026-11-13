@@ -10,8 +10,8 @@
 namespace aero::ipc {
 
 constexpr std::uint32_t kMagic = 0x4F524541;  // "AERO"
-constexpr std::uint32_t kVersion = 1;
-constexpr int kMaxFeatures = 24;
+constexpr std::uint32_t kVersion = 2;  // 2: kMaxFeatures grew from 24 to 32, the block layout changed
+constexpr int kMaxFeatures = 32;
 constexpr int kMaxTelemetry = 16;
 
 enum Kind : LONG { kToggle = 0, kButton = 1 };

@@ -241,84 +241,16 @@ Checked here: `gradlew build` exit 0; `runSelftest` PASSED; `runWorldtest` 162 p
 Not verified: the circling in the user's real world (cause matched on a synthetic road only); tool durability is ignored (a nearly broken pickaxe can be chosen); a tool breaking mid-vein is handled by the pre-block check but has no test; X-Ray with Iris and other Sodium versions; servers that strip the night vision effect; Nuker and AutoLumber still use the hotbar only; the new jar was not run in the user's real profile.
 Next verifiable step: put `build/out/modules/aeroclient.jar` into the profile, mine a diamond vein with an iron pickaxe, then a road over hills; if it loops again, take `logs/latest.log` and the terrain description.
 
-## Update 23: terrain/water-aware trajectory, incoming shells, aim calculator, weak links, enemy timers, battle stats
+## Update 23: Forts battery (more than 3 guns, one place)
 
-Request: everything from "information and analysis" list 1 (works online without the mod because it only reads); and the trajectory must run to the end of the ground, with water treated as a separate surface (the user had a water problem in an earlier trajectory mod).
-
-Measured (static, Forts.exe on disk, buildid 26181732; `tools/forts_api_table.py` dumps every Lua-API name -> handler from the registration code, the pairs `lea r8,[handler]` / `lea rdx,[name]`; 1333 names, known handlers matched FortsConfig.hpp):
-- GetWaterLevel 0xE05B0 `float(float x)`: piecewise-constant table (world+0x12E8..0x12F0, 12-byte entries); ~2.1e9 on maps without water. GetWaterDepthAt 0xE0540 = pos.y - level, so deeper is a LARGER y (gravity +y): in the water when y >= GetWaterLevel(x). All real calibrations in FortsModule.log say gravitySign=1.
-- CastGroundRay 0xD9570 `int(const Vec3* a, const Vec3* b, int flags)` (1 = terrain hit; flags 0 as the game's own mods pass it), GetRayHitPosition 0xD9E60 `Vec3*(Vec3* out)`.
-- IsWeaponReadyToFire 0xD7610 `bool(int id)`, GetWeaponReloadTime 0xE41B0 `float(int id)` (= period * fraction at weapon+0x4B8), GetWeaponReloadPeriodById 0xE3F30; none checks the team. Node field +0x18 = terrain block index (GetNodeGroundBlockIndex 0xE2690).
-- Config entries are in FortsConfig.hpp; their RVAs and prologues were cross-checked against the dump.
-
-Done: `Tactics.hpp` (pure: TraceShot with ground + water, SolveAim, FindWeakLinks (bridges of the support graph), LostLinks, DragFromSpeeds), `Ballistics.hpp::ArcAt`, GameApi (GroundRay, WaterLevelAt, WeaponReady, WeaponReload, BaseGraphOf), Features.cpp: trajectory stops at terrain or water and marks the landing point with the flight time (yellow = ground, blue = water); menu items "Incoming shells warning", "Aim calculator (needs a target)", "Enemy gun timers", "Weak links: enemy base / your base", "Battle stats panel" (all read-only, allowed online; 23 of the hub channel's 24 feature slots are used). Battle stats append one line per match to `FortsStats.csv` next to the module.
-Checked here: Tactics checks (4254, incl. brute-force comparison of weak links on random graphs, round-trip of the aim solver, water/terrain cases); menu and panels rendered offline from the real Menu.cpp / Hud.cpp (no truncation). Built: `cmake --build build --config Release --target FortsModule`, exit 0.
-
-NOT verified in game (the log lines to look at are in brackets):
-- That calling the new handlers from the SwapBuffers hook is safe and returns what the disassembly says; the price of a ray cast ("terrain ray: N casts, X us per cast"). If it is high, trace steps in `TraceCached` need to be coarser.
-- Terrain contacts within 30 units of the barrel are ignored (kTraceGrace); what CastGroundRay does for a segment that starts inside terrain is unknown.
-- ProjectileIds(enemy team code) returns the enemy's shells (shells are probably listed per side; ids are de-duplicated). Threat radius 90 units is not calibrated against real splash.
-- Weak links assume node+0x18 >= 0 means anchored to terrain; a device hangs on the nearest link within 60 units; weights (reactor 1000, gun 120, other 10) are priorities, not measurements. If no anchored node is found the panel says so.
-- Enemy timers: the sign of GetWeaponReloadTime is learned from the first reloads seen to the end ("timers: the reload value counts ..."); until then the bar is amber and only READY is exact.
-- Battle stats are estimates (shots from our projectiles appearing, hit = last point within 90 units of an enemy device, damage = loss of device HP between refreshes).
-
-Next verifiable step: start Forts on OpenGL, inject, in a match turn the features on; on a water map (dlc2_MP 2) check that shells end on the surface; read FortsModule.log for the lines above; send the log with Collect logs.
-
-
-## Update 24: exact trajectory physics (frame model, measured drag, stops)
-
-Request: "Траектория должна быть максимально точная".
-
-Measured (501 recorded shots, Physics.FramesRate=25, 4998 positions):
-- The game steps projectiles in fixed frames h = 0.04 s: `vx -= k*vx*h; vy += (g - k*vy)*h; x += vx*h; y += vy*h` (semi-implicit, drag from the old velocity, linear drag). y points down.
-- k = 4.0 * ProjectileDrag (kDragFactor evidence comes from ONE type: machinegun 0.021 -> 0.0840; cannon 0). The module also measures k live from consecutive velocity samples (EstimateDragFrames) and prefers that (n >= 2) over the formula.
-- Shells with ProjectileDrag >= 2 (missile 64) are thrust driven: not predicted, no trajectory drawn.
-- Old model vs recorded positions (mean error, world units): cannon <=1 s 10.5 -> 0.05, 1-2 s 23.0 -> 0.06; machinegun <=1 s 27.4 -> 0.06, 1-2 s 130 -> 0.07 (max 235 -> 0.19). The old numbers use the learned drag the old FortsDrag.ini held, so they show what the user saw.
-
-Code: `modules/forts/Tactics.hpp` (`TraceShot` frame by frame with terrain ray per chunk, water crossing interpolated, grace distance; `EstimateDragFrames`; `SolveAim` on the same physics), `Features.cpp` (`DragFor`: measured -> formula -> 0; learned values in `FortsDrag.v2.ini`, the old biased file is ignored), `Ballistics.hpp` (`ArcAt`, legacy).
-
-Isolated checks (scratchpad tactics_test.cpp): 593 passed, 0 failed, including real-data validation (worst position error 0.186, rms 0.066) and the drag estimator exact on 4975/4975 real pairs.
-
-Not verified in game / not modeled:
-- Launch offset: the first shell state seen vs barrel + FireVelocity. `launch:` lines (<=40 per session) are written to FortsModule.log for calibration.
-- Stops on structures (CastRay semantics unverified), shields/fields speed drops, thrust shells, fire spread, moving barrels.
-- Cost of terrain rays and thread safety of the new handlers in the SwapBuffers hook ("terrain ray: ... us per cast" in the log).
-
-Release: nothing committed/pushed; no v1.3.0 approval. dist/ installer is still v1.2.0.
-
-Update 25: menu language (EN/RU). First row of the General tab ("Language / Язык") switches; the choice is saved in FortsLang.ini next to FortsModule.dll. Rows are grouped under captions. Hub window feature names and in-game HUD panels (stats, aim, weak links) stay English. Not verified in game; rendered in isolation with the real Menu.cpp (the Russian strings fit after shortening the repair-speed values and the online note).
-
-Update 26: menu redesign, key binds, calculator on the selected gun, passive self-test
-- Menu (Menu.cpp/.hpp rewritten): 820-unit wide window, a card per function with a one-line description, a key box and a Toggle/Hold box per function, header drag to move, Settings tab (language, menu size 85-200%). Binds are stored in FortsBinds.ini (item<N>=vk,hold; defaults F6 unlimited, End all off, F9 pick target), language/size in FortsLang.ini.
-- Aim calculator: uses the gun returned by GetLocalSelectedDeviceId (0xCF710, int(), prologue-checked; "selected" semantics unverified in game); target is chosen with the new "Pick target under cursor" bind via GetMousePos (0xE6700) + ScreenToWorld (0xE68B0) (same screen space is unverified; the self-test logs a round trip).
-- Self-test (passive, never fires): a file FortsSelfTest.txt next to the DLL enables it. It logs, about 4 s into a match, camera water level, terrain ray cost, selected device, node+0x18 values of every base, weapon timers, mouse->world; and for every shell it predicts the path after the drag is measured and logs how far the last seen point was from the path and whether the shell ended where predicted ("selftest:" lines in FortsModule.log). Old 40 MB log kept as FortsModule.before-selftest.log.
-- Weak links "no ground-anchored nodes found": likely floating (ship) bases; the self-test node+0x18 distribution decides. Not changed yet.
-- Built: cmake --build build --config Release --target FortsModule, exit 0. Not run in game.
-
-Update 27 (test run, interrupted): first in-game run with FortsSelfTest.txt. Measured: ScreenToWorld round trip exact; terrain ray 1.78 us/cast; GetLocalSelectedDeviceId faulted with no gun selected (re-check with a gun selected); environment block fired before the lists were filled (fixed in Features.cpp: runs when own/enemy lists are non-empty, again 60 s later; compiles, DLL not yet rebuilt because Forts held it). Next: close Forts, rebuild FortsModule, play a skirmish (water map dlc2_MP 2), select a gun, run `python -I selftest_report.py <FortsModule.log>` (scratchpad) for the shell/landing report; decide weak-links anchor from the node+0x18 distribution.
-
-## Update 28 (2026-11-09): movable HUD panels
-- Request: "Все оверлеи тоже должны перетаскиваться". Panels aimcalc, weak, stats, intel, radar (Features.cpp, section "movable panels": PlacePanel, PanelPointer, FortsPanels.ini).
-- Works only while the menu is open: left-drag moves a panel, right-click resets it. Position is clamped to the viewport; the game does not receive the mouse over a panel (same path as the menu).
-- Built (cmake --build build --config Release --target FortsModule, exit 0, DLL 18:12). NOT run in game. World-attached overlays (enemy labels, timers, trajectories) are not panels and are not movable.
-- Offline checks this session: tactics_test 589 passed / 0 failed; preview_ru renders the menu (820x722 and 820x548), images not visually reviewed.
-
-## Update 29 (2026-11-13): port to the updated Forts (buildid 26581374)
-- Symptom: the friend's hub (v1.3.0) showed "Unsupported game build: stamp 0x6AF3D1A6, size 0x9D2000 (profile expects 0x6ADC9FAD / 0x9D3000)". Steam updated Forts on 2026-11-11 (the user's own Forts.exe is the same new build); v1.2.0/v1.3.0 only know buildid 26181732.
-- Measured on the new Forts.exe (static): all 1333 Lua-API names still present; handler RVAs of every function the module uses are unchanged (40 of 40); only 31 unused handlers moved (Debug*, LOG, SetNodeAngle, SpawnParticle, TriggerSound...). Disassembly of 11 handlers (CastGroundRay, CastRay, GetNodeGroundBlockIndex, GetProjectileTypeDrag, GetRayHitPosition/TeamId, GetWaterDepthAt/Level, reload timers, IsWeaponReadyToFire) is identical to the old build with addresses masked, so struct offsets are taken as unchanged (assumption, not live-verified).
-- Changed values (FortsConfig.hpp): TimeDateStamp 0x6AF3D1A6, SizeOfImage 0x9D2000, game singleton RVA 0x91D230 -> 0x91C230 (555 handlers agree), SwapBuffers IAT 0x762110 -> 0x761110 (parsed from the import table), kAimAngleRva 0x91B3B4 / kAimSpeedRva 0x91B4AC (decoded from GetAimWeaponAngle/Speed), 26 of 40 prologue byte arrays (rip-relative displacements). All 40 prologues checked against the exe on disk: 40/40 match.
-- profiles/forts.ini and README updated. Built: full Release exit 0; installer rebuilt (dist/, SHA-256 30AAA163...EEFC, not published). NOT run in game; the old build is no longer supported by this module.
-- Scratch: scratchpad/port (old_api.tsv vs new_api.tsv, cmp.py, glob.py, disdiff).
-
-## Update 30 (2026-11-13): version in the hub and an update button
-- Request: show the version in the app with an update button next to it. Note: the earlier "auto update" job was stopped and never built; v1.3.0 / v1.3.1 have NO update code. Anyone on those versions installs the next release by hand once.
-- New: core/Version.hpp (kAppVersion, currently "1.3.1": bump it with every release tag), core/Update.hpp/.cpp (WinHTTP + BCrypt, linked into AeroHub only), sidebar row "Version X | button" in hub/main.cpp.
-- Behaviour: at start (and on the button) the hub reads GET api.github.com/repos/zework12/AeroHub/releases/latest. States: Check updates / Checking... / Up to date / Update vX.Y.Z / Downloading... / Retry check. Update click: confirmation box, refuses while a game runs with the module loaded, downloads AeroHub-Setup.exe to %TEMP%\AeroHub-Update, verifies size, "MZ", and SHA-256 against the asset "digest" from the API (a release without that digest is rejected), starts the installer after a 2 s ping pause and closes the hub. The user starts the hub again from the Start menu. AeroHub.ini [Hub] CheckUpdates=0 disables the check at start. Download URL must start with https://github.com/zework12/AeroHub/releases/download/.
-- Checks: isolated test (scratchpad/update_test.cpp): 16 offline checks (versions, SHA-256 known answer, release JSON accept/reject cases) + live read-only run against the real v1.3.1 release (fetch ok, download 1146880 bytes, SHA matches, tampered digest rejected): 19/19. Hub built (AeroHub target, exit 0), window captured: "Version 1.3.1 | Up to date".
-- Not verified: the "Update vX" state and the real install-and-close path (needs a release newer than the running version), that the iexpress installer finishes before the user restarts the hub. Not committed, not released.
-
-## Update 31 (2026-11-13): hub language switch EN/RU, release v1.3.2
-- Request: an English/Russian switch in the app, then publish ("тогда можешь выкладывать" = approval for v1.3.2).
-- Hub (hub/main.cpp): `g_lang` + `Tr(en, ru)`; sidebar row "Language | EN | RU" under the version row; stored in AeroHub.ini [Hub] Language=en|ru, first run follows the Windows UI language. Translated: sidebar, header buttons, statuses, guide card, live-info chrome, log tab names, message boxes, update button states, known hotkey hints from the profiles. Not translated on purpose: Hub log lines, the module's log, the Live info row names sent by the module, error text produced in core/ (Diagnostics, Minecraft, Inject).
-- Version bumped to 1.3.2 (core/Version.hpp). Built: full Release exit 0; window captured in EN and RU (no truncation after shortening a few RU strings); the EN/RU buttons were clicked by simulated mouse messages and the ini changed accordingly.
-- Installer sha256 fed17c45ee86a81ec5c6dc5eb3f20d1794b5bde51f42be47e4946470033b2402 (the first v1.3.2 upload briefly carried the old installer because the build step had not run; replaced right after publishing).
+Request: a group of more than 3 guns, all aimed at one place (6 guns of a base shooting at one point). Second request: no settings; select the group as in the game; one switch to turn it on and one to assign the target.
+Done (Combat tab, section BATTERY, two items, rebindable, no default keys because F7/F8 belong to the game):
+- "Battery: on" (toggle): every gun the player selects in the game (GetLocalSelectedDeviceId, polled each frame, must be one of the own guns) joins one group of up to 32 guns, so the game's own limit of 3 no longer matters. While a target exists every group gun is kept aimed at it (UpdateWeaponAim). Off = the group and the target are cleared.
+- "Battery: target + fire" (button): the world point under the mouse (MouseWorld) becomes the target and every ready gun of the group fires at it in one frame (the game's FireWeapon). It turns the battery on if it was off. Each further press fires another salvo at the new point. The row shows the group size.
+- Offline only (both refuse online). Beam guns are skipped by the salvo (they need EndFireWeapon after a hold time). Vanished guns leave the group (checked twice a second). Overlay: numbered rings on the group guns, lines to the target, a cross on it.
+- Native call `FireWeapon` (RVA 0xE5E50, buildid 26181732): a thunk to FireWeaponWithPower (0xE5B00); shape `int(int id, const Vec3* target, float stdDev, int flags)` read from its bytes. FIREFLAG values decoded from the compiled data/scripts/forts.lua: NORMAL 0, TEST 1, FORCEDOORSOPEN 2, IGNOREFASTDOORS 4, TERRAINBLOCKS 8, EXTRACLEARANCE 16, IGNORESPOTTER 32, STRUCTURETEST 64, DIRECTAIM 128, IGNORERELOADING 256; FIREWEAPON_STDDEVTEST_DEFAULT -1.0. Only NORMAL is used. The numeric FIRE_* result codes were not measured; the log prints them raw (`group fire at ...: ... raw FIRE_* codes (gun:code)`).
+- Hub channel: core/Ipc.hpp kMaxFeatures 24 -> 26 needed, set to 32, and kVersion 1 -> 2 (the shared block grew; hub and module must come from the same build).
+Built: `cmake --build build --config Release` exit 0 (hub and FortsModule.dll).
+Not verified in the game: that the Vec3 argument of FireWeapon is a pointer (by analogy with AimWeapon/UpdateWeaponAim), that FireWeapon aims as well as fires, that UpdateWeaponAim does the ballistic solve, what the FIRE_* codes mean, and that a box-selection of several guns in the game shows up in GetLocalSelectedDeviceId (it returns one id, so only the primary selected gun is seen; select guns one by one).
+Next verifiable step: offline match, turn Battery on, click each of 4-6 guns once, point the mouse at the target and press the key bound to "Battery: target + fire"; read FortsModule.log for the `battery:` lines and the raw codes.
+First in-game run (log 2026-11-14 00:18-00:20): the battery collected 6 guns, 5 salvos were called, every gun returned code 12 (nothing fired). Disassembly of FireWeaponWithPower (0xE5B00): the Vec3 argument is a pointer (three floats read from it); code 12 is the exit at 0xE5E16 taken when the gun's team code is neither -1 nor equal to the int "script team context" at RVA 0x91B440 (also read by the ownership check at 0xC6310). Fix: `GameApi::FireWeaponAt` sets that int to -1 for the call and restores it; the log prints the value it found (`script team context was N`). Rebuilt (exit 0). Not yet run in game with the fix. If the code is still 12, the next suspect is the other branch (0xE5C3B / 0xC6310 called with the gun's team code); if it becomes 11 (0xE5E1D) the target is out of the allowed coordinate range or the gun is flagged (+0x3AA).

@@ -80,6 +80,23 @@ inline constexpr int kMaxTeamCode = 9999;
 inline constexpr ApiFn kSendScriptEvent{"SendScriptEvent", 0xC6F60, {0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x6C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x57}};
 inline constexpr ApiFn kUpdateWeaponAim{"UpdateWeaponAim", 0xE5330, {0x40, 0x53, 0x48, 0x83, 0xEC, 0x40, 0x48, 0x8B, 0x05, 0xF3, 0x6E, 0x83, 0x00, 0x45, 0x33, 0xC0}};
 
+// FireWeapon (0xE5E50, Lua name FireWeapon(weaponId, target, stdDev, flags) as used by data/ai/ai.lua), buildid 26181732.
+// Read from the 0x30-byte thunk: it keeps r9d (flags) and the constant -1.0f (= FIREWEAPON_STDDEVTEST_DEFAULT) on the stack and
+// calls FireWeaponWithPower (0xE5B00), so the native shape is int(int weaponId, const Vec3* target, float stdDev, int flags) and the
+// return value is the game's FIRE_* code (the numeric FIRE_* values were not measured; the module logs the raw number).
+// The target is a pointer by analogy with AimWeapon / UpdateWeaponAim (the thunk passes rdx through untouched): NOT confirmed in game.
+inline constexpr ApiFn kFireWeapon{"FireWeapon", 0xE5E50, {0x48, 0x83, 0xEC, 0x38, 0xF3, 0x0F, 0x10, 0x1D, 0xB0, 0x13, 0x73, 0x00, 0xF3, 0x0F, 0x11, 0x5C}};
+// FIREFLAG_* values: decoded from the SETGLOBAL instructions of data/scripts/forts.lua (compiled Lua 5.1, float numbers):
+// NORMAL 0, TEST 1, FORCEDOORSOPEN 2, IGNOREFASTDOORS 4, TERRAINBLOCKS 8, EXTRACLEARANCE 16, IGNORESPOTTER 32, STRUCTURETEST 64,
+// DIRECTAIM 128, IGNORERELOADING 256. Only the plain "fire for real" value is used.
+inline constexpr int kFireFlagNormal = 0;
+// Why the first in-game try returned 12 for every gun: FireWeaponWithPower (0xE5B00) compares the team code of the gun with a global
+// int, the "script team context" at RVA 0x91B440 (the same address is read by 0xC6310, an ownership check; -1 means "any team"),
+// and returns 12 (the failure exit at 0xE5E16, the last of the FIRE_* names = FIRE_NOTOWNED if the names count up from 0) when it
+// is neither -1 nor the gun's team code. A call from outside a script has some other value there, so the module sets it to -1
+// for the duration of the call and puts the old value back. Measured by disassembly of buildid 26181732; not yet seen working.
+inline constexpr std::uintptr_t kScriptTeamContextRva = 0x91B440;
+
 // Terrain, water and weapon-timer queries. Addresses: the game's own Lua registration table (every `lea r8,[handler]` /
 // `lea rdx,[name]` pair in .text of Forts.exe on disk, buildid 26181732); signatures: read from the handlers' disassembly.
 //   GetWaterLevel(float x) -> float      piecewise-constant table at world + 0x12E8..0x12F0 (12-byte entries: x threshold, level, ...);

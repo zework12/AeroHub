@@ -58,6 +58,8 @@ enum Item {
     kItemStats, kItemRecord, kItemDiagnostics, kItemAllOff,
     // Added later (kept at the end so the hub channel ids of the older items do not move); shown in the Combat tab
     kItemPickTarget,
+    // Battery: guns selected in the game pile up in one group of any size (the game's own stops at three)
+    kItemBattery, kItemBatteryTarget,
     kItemCount
 };
 constexpr const char* kItemNames[kItemCount] = {
@@ -65,15 +67,17 @@ constexpr const char* kItemNames[kItemCount] = {
     "Auto-repair", "Repair speed", "Repair what", "Trajectory overlay", "Impact markers", "Incoming shells warning",
     "Aim calculator (needs a target)", "Auto-aim at target", "Enemy overlay", "Enemy base window (observer)", "Enemy intel (spy panel)",
     "Enemy gun timers", "Weak links: enemy base", "Weak links: your base", "Battle stats panel", "Record shots to log",
-    "Write diagnostics to log", "All off", "Pick target under cursor"};
+    "Write diagnostics to log", "All off", "Pick target under cursor",
+    "Battery: on", "Battery: target + fire"};
 constexpr aero::ipc::Kind kItemKinds[kItemCount] = {
     aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle,
     aero::ipc::kButton, aero::ipc::kButton,  // repair speed / repair what (choice rows)
     aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle,  // combat
     aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle,  // enemy
     aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kButton, aero::ipc::kButton,  // tools
-    aero::ipc::kButton};                                                              // pick target
-constexpr int kItemTab[kItemCount] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 1};
+    aero::ipc::kButton,                                                               // pick target
+    aero::ipc::kToggle, aero::ipc::kButton};                                          // battery: on, target + fire
+constexpr int kItemTab[kItemCount] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 1, 1, 1};
 static_assert(kItemCount <= aero::ipc::kMaxFeatures, "the hub channel has room for kMaxFeatures features");
 
 // Repair speed levels: share of the maximum health restored per second. "Instant" restores everything each pass.
@@ -94,7 +98,8 @@ constexpr const wchar_t* kItemNamesRu[kItemCount] = {
     L"Предупреждение о снарядах", L"Расчёт прицела (нужна цель)", L"Автонаведение на цель", L"Оверлей врага",
     L"Окно базы врага (наблюдатель)", L"Разведка врага (панель шпиона)", L"Таймеры орудий врага", L"Слабые звенья: база врага",
     L"Слабые звенья: моя база", L"Панель статистики боя", L"Запись выстрелов в лог", L"Записать диагностику в лог", L"Выключить всё",
-    L"Выбрать цель под курсором"};
+    L"Выбрать цель под курсором",
+    L"Батарея: включить", L"Батарея: цель и огонь"};
 constexpr const wchar_t* kItemDescEn[kItemCount] = {
     L"Metal and energy never run out",
     L"Struts build instantly (offline only)",
@@ -119,7 +124,9 @@ constexpr const wchar_t* kItemDescEn[kItemCount] = {
     L"Writes shot data to the log for calibration",
     L"Writes a state report to the log once",
     L"Switches every feature off",
-    L"Target = the enemy device nearest to the mouse"};
+    L"Target = the enemy device nearest to the mouse",
+    L"Every gun you select in the game joins one group, no limit of 3. Off = the group is emptied (offline only)",
+    L"Target = the point under the mouse: the whole group aims there and fires a salvo (offline only)"};
 constexpr const wchar_t* kItemDescRu[kItemCount] = {
     L"Металл и энергия не заканчиваются",
     L"Балки строятся мгновенно (только офлайн)",
@@ -144,7 +151,9 @@ constexpr const wchar_t* kItemDescRu[kItemCount] = {
     L"Пишет данные выстрелов в лог для калибровки",
     L"Один раз пишет отчёт о состоянии в лог",
     L"Выключает все функции",
-    L"Цель — вражеское устройство ближе всего к мыши"};
+    L"Цель — вражеское устройство ближе всего к мыши",
+    L"Каждое орудие, выбранное в игре, входит в одну группу, без лимита в 3. Выкл = группа очищается (только офлайн)",
+    L"Цель = точка под мышью: вся группа наводится туда и даёт залп (только офлайн)"};
 constexpr const wchar_t* kRepairSpeedRu[4] = {L"Медл. 8%/с", L"Сред. 25%/с", L"Быстр. 60%/с", L"Мгновенно"};
 constexpr const wchar_t* kRepairWhatRu[3] = {L"Всё", L"Устройства", L"Балки"};
 constexpr const wchar_t* kTabNamesRu[kTabCount] = {L"Общее", L"Бой", L"Враг", L"Инструменты", L"Настройки"};
@@ -197,6 +206,7 @@ const wchar_t* SectionBefore(int item) {
         case kItemTrajectory: return Tr(L"MY SHOTS", L"МОИ ВЫСТРЕЛЫ");
         case kItemThreats: return Tr(L"DEFENCE", L"ЗАЩИТА");
         case kItemAimCalc: return Tr(L"AIMING", L"НАВЕДЕНИЕ");
+        case kItemBattery: return Tr(L"BATTERY (ANY NUMBER OF GUNS, ONE PLACE)", L"БАТАРЕЯ (ЛЮБОЕ ЧИСЛО ОРУДИЙ, ОДНО МЕСТО)");
         case kItemEnemyOverlay: return Tr(L"ENEMY INFORMATION", L"ИНФОРМАЦИЯ О ВРАГЕ");
         case kItemWeakEnemy: return Tr(L"WEAK LINKS", L"СЛАБЫЕ ЗВЕНЬЯ");
         case kItemStats: return Tr(L"STATISTICS", L"СТАТИСТИКА");
@@ -247,6 +257,12 @@ struct State {
     float reloadA = 0, reloadB = 0;
     bool warnedMaterials = false, loggedMaterials = false;
     int aimTarget = 0;  // enemy device id chosen in the Enemy tab, 0 = none
+    std::vector<int> group;  // own guns chosen as one battery; the group target is groupPoint, else the aimTarget device
+    bool battery = false;  // on: guns selected in the game pile up in `group`, and are kept aimed at the target
+    int lastSelected = 0;
+    bool groupPointSet = false;
+    Vec3 groupPoint{};
+    int framesSincePrune = 0;
     int faults = 0;
     bool loggedCalibration = false;
     bool warnedCalibration = false;
@@ -700,6 +716,17 @@ void SetAutoAim(bool on) {
     Logf("auto-aim: %d (target %d)", on ? 1 : 0, g_state.aimTarget);
 }
 
+void SetBattery(bool on) {
+    if (RefusedOnline(on, "battery")) return;
+    g_state.battery = on;
+    if (!on) {
+        g_state.group.clear();
+        g_state.groupPointSet = false;
+        g_state.lastSelected = 0;
+    }
+    Logf("battery: %d", on ? 1 : 0);
+}
+
 void SetEnemyOverlay(bool on) {
     g_state.enemyOverlay = on;
     Logf("enemy overlay: %d", on ? 1 : 0);
@@ -755,6 +782,7 @@ void AllOff() {
     g_state.record = false;
     g_state.impact = false;
     g_state.autoAim = false;
+    if (g_state.battery) SetBattery(false);
     g_state.enemyOverlay = false;
     g_state.radar = false;
     g_state.intel = false;
@@ -776,7 +804,9 @@ void UpdateOnline(bool online) {
     Logf("network game: %d", online ? 1 : 0);
     if (!online) return;
     g_state.unlimited = g_state.fastBeams = g_state.fastDevices = g_state.fastReload = false;
-    g_state.commander = g_state.repair = g_state.autoAim = false;
+    g_state.commander = g_state.repair = g_state.autoAim = g_state.battery = false;
+    g_state.group.clear();
+    g_state.groupPointSet = false;
     g_state.framesSinceUnlimited = 0;
     g_state.buildApplied = g_state.buildSaved = false;
     g_state.reloadApplied = g_state.reloadSaved = false;
@@ -1482,6 +1512,131 @@ void ApplyAutoAim(int team) {
     }
 }
 
+// ---------------------------------------------------------------- gun group
+// A battery of own guns of any size (the game's own selection stops at three). Every id comes from the game itself
+// (GetLocalSelectedDeviceId / GetWeaponId); ids of guns that no longer exist are dropped. Target: the point set with
+// "Group: target = cursor point", otherwise the enemy device chosen as the auto-aim target.
+constexpr std::size_t kMaxGroup = 32;
+
+bool GroupTarget(Vec3& out) {
+    if (g_state.groupPointSet) {
+        out = g_state.groupPoint;
+        return true;
+    }
+    return g_state.aimTarget != 0 && g_api.DevicePosition(g_state.aimTarget, out);
+}
+
+bool InGroup(int id) { return std::find(g_state.group.begin(), g_state.group.end(), id) != g_state.group.end(); }
+
+void PruneGroup(int team) {
+    if (g_state.group.empty()) return;
+    std::vector<int> own;
+    if (!g_api.OwnWeapons(team, own)) return;  // a failed read says nothing about the guns
+    const std::size_t before = g_state.group.size();
+    g_state.group.erase(std::remove_if(g_state.group.begin(), g_state.group.end(),
+                                       [&](int id) { return std::find(own.begin(), own.end(), id) == own.end(); }),
+                        g_state.group.end());
+    if (g_state.group.size() != before) Logf("group: %zu gun(s) gone, %zu left", before - g_state.group.size(), g_state.group.size());
+}
+
+// Battery on: the gun the player has selected in the game joins the group (checked whenever the selection changes). Vanished guns are
+// dropped twice a second, and every group gun is kept turned onto the target while one is set.
+void UpdateGroup(int team, bool offline) {
+    if (!g_state.battery) return;
+    int selected = 0;
+    if (g_api.SelectedDevice(selected) && selected > 0 && selected != g_state.lastSelected) {
+        g_state.lastSelected = selected;
+        std::vector<int> own;
+        if (!InGroup(selected) && g_api.OwnWeapons(team, own) && std::find(own.begin(), own.end(), selected) != own.end()) {
+            if (g_state.group.size() < kMaxGroup) {
+                g_state.group.push_back(selected);
+                Logf("battery: gun %d joined, %zu in the group", selected, g_state.group.size());
+            } else {
+                Logf("battery: full (%zu guns)", kMaxGroup);
+            }
+        }
+    } else if (selected <= 0) {
+        g_state.lastSelected = 0;  // nothing selected: the same gun selected again counts as new
+    }
+    if (g_state.group.empty()) return;
+    if (++g_state.framesSincePrune >= 30) {
+        g_state.framesSincePrune = 0;
+        PruneGroup(team);
+    }
+    if (!offline) return;
+    Vec3 pos;
+    if (!GroupTarget(pos)) return;
+    for (int id : g_state.group) g_api.AimWeaponAt(id, pos);
+}
+
+// FireWeapon (the game's own call, as the AI scripts use it) for every ready gun of the group, in one frame, at the same point.
+// Beam guns are skipped: they need EndFireWeapon after a hold time, which is not handled here.
+void GroupFire() {
+    if (g_online) {
+        Logf("group fire refused: it would desync a network game");
+        return;
+    }
+    int team = 0;
+    if (!g_api.LocalTeam(team)) {
+        Logf("group fire: no local team (not in a match)");
+        return;
+    }
+    PruneGroup(team);
+    if (g_state.group.empty()) {
+        Logf("group fire: the group is empty");
+        return;
+    }
+    Vec3 target;
+    if (!GroupTarget(target)) {
+        Logf("group fire: no target (set a point under the cursor, or pick an enemy target)");
+        return;
+    }
+    int fired = 0, notReady = 0, beams = 0, faulted = 0;
+    std::string codes;
+    for (int id : g_state.group) {
+        bool ready = false;
+        if (g_api.WeaponReady(id, ready) && !ready) {
+            ++notReady;
+            continue;
+        }
+        std::string projectile;
+        float gravity = 0.0f;
+        if (g_api.WeaponProjectile(id, team, projectile, gravity) && std::fabs(gravity) < 0.001f) {
+            ++beams;
+            continue;
+        }
+        int result = 0, contextBefore = 0;
+        if (!g_api.FireWeaponAt(id, target, cfg::kFireFlagNormal, result, contextBefore)) {
+            ++faulted;
+            continue;
+        }
+        ++fired;
+        codes += " " + std::to_string(id) + ":" + std::to_string(result);
+        if (fired == 1) codes += "(script team context was " + std::to_string(contextBefore) + ")";
+    }
+    Logf("group fire at (%.0f, %.0f): %d called, %d not ready, %d beam gun(s) skipped, %d faulted; raw FIRE_* codes (gun:code)%s",
+         target.x, target.y, fired, notReady, beams, faulted, codes.c_str());
+}
+
+// "Battery: target + fire": the point under the mouse becomes the target of the whole group, which fires a salvo at it. Turns the
+// battery on when it is off (the group then starts empty).
+void BatteryTarget() {
+    if (g_online) {
+        Logf("battery target refused: it would desync a network game");
+        return;
+    }
+    if (!g_state.battery) SetBattery(true);
+    Vec3 screen{}, world{};
+    if (!g_api.MouseWorld(screen, world)) {
+        Logf("battery: the mouse position could not be read");
+        return;
+    }
+    g_state.groupPoint = world;
+    g_state.groupPointSet = true;
+    Logf("battery: target point (%.0f, %.0f), %zu gun(s) in the group", world.x, world.y, g_state.group.size());
+    GroupFire();
+}
+
 // ---------------------------------------------------------------- drawing: trajectories, enemies, radar
 bool PrepareCalibration(int w, int h) {
     g_calOk = Calibrate(w, h, g_cal);
@@ -1663,6 +1818,31 @@ void DrawTrajectories(int team) {
             for (const EnemyDev& e : g_enemy)
                 if (DistanceToPolyline({e.pos.x, e.pos.y}, tr.pts.data(), n) < 70.0f) g_hitIds.insert(e.id);
         }
+    }
+}
+
+// Group markers: a numbered ring on every group gun, a thin line from each to the group target, a cross on the target.
+void DrawGroup() {
+    if (g_state.group.empty() && !g_state.groupPointSet) return;
+    Vec3 target{};
+    float tx = 0, ty = 0;
+    const bool targetShown = GroupTarget(target) && WorldToPixels(target, tx, ty);
+    int n = 0;
+    for (int id : g_state.group) {
+        ++n;
+        Vec3 pos;
+        float x = 0, y = 0;
+        if (!g_api.DevicePosition(id, pos) || !WorldToPixels(pos, x, y)) continue;
+        Ring(x, y, 14.0f * g_uiScale, 0.2f, 0.9f, 0.6f, 0.95f, 2.0f);
+        DrawLabel(L"G" + std::to_wstring(n), aero::ui::kOk, x, y + 18.0f * g_uiScale);
+        if (targetShown) {
+            const float line[4] = {x, y, tx, ty};
+            g_overlay.Line(line, 2, 0.2f, 0.9f, 0.6f, 0.35f, 1.0f);
+        }
+    }
+    if (targetShown) {
+        Cross(tx, ty, 16.0f * g_uiScale, 1.0f, 0.35f, 0.3f, 1.0f, 2.5f);
+        Ring(tx, ty, 26.0f * g_uiScale, 1.0f, 0.35f, 0.3f, 0.9f, 2.0f);
     }
 }
 
@@ -2586,6 +2766,7 @@ void PickTargetUnderMouse() {
         return;
     }
     g_state.aimTarget = g_state.aimTarget == best->id ? 0 : best->id;
+    g_state.groupPointSet = false;  // an enemy device picked now is the group's target too
     Logf("pick target: %s #%d at distance %.0f from the mouse -> target %d", best->type.c_str(), best->id, bestD, g_state.aimTarget);
 }
 
@@ -2603,6 +2784,7 @@ bool ItemOn(int item) {
         case kItemThreats: return g_state.threats;
         case kItemAimCalc: return g_state.aimCalc;
         case kItemAutoAim: return g_state.autoAim;
+        case kItemBattery: return g_state.battery;
         case kItemEnemyOverlay: return g_state.enemyOverlay;
         case kItemRadar: return g_state.radar;
         case kItemIntel: return g_state.intel;
@@ -2647,6 +2829,8 @@ void ActivateItem(int item) {
         case kItemDiagnostics: g_state.wantDiagnostics = true; break;
         case kItemAllOff: AllOff(); break;
         case kItemPickTarget: PickTargetUnderMouse(); break;
+        case kItemBattery: SetBattery(!g_state.battery); break;
+        case kItemBatteryTarget: BatteryTarget(); break;
     }
 }
 
@@ -2672,6 +2856,7 @@ void ActivateRowId(int id) {
         const std::size_t t = static_cast<std::size_t>(id - kRowIdTarget);
         if (t < g_targets.size()) {
             g_state.aimTarget = g_state.aimTarget == g_targets[t] ? 0 : g_targets[t];
+            g_state.groupPointSet = false;
             Logf("auto-aim target: %d", g_state.aimTarget);
         }
     }
@@ -2736,12 +2921,15 @@ void BuildRows(std::vector<MenuRow>& rows) {
         r.bindText = g_binds[i].vk ? KeyName(g_binds[i].vk) : std::wstring();
         r.bindHold = g_binds[i].hold;
         r.capturing = g_bindCapture == i;
-        if (g_online && (i == kItemFastBeams || i == kItemAutoAim)) {
+        if (g_online && (i == kItemFastBeams || i == kItemAutoAim || i == kItemBattery || i == kItemBatteryTarget)) {
             r.toggle = false;
             r.value = Tr(L"Offline only", L"Только офлайн");
         } else if (g_online && (i == kItemRepairSpeed || i == kItemRepairWhat)) {
             r.toggle = false;
             r.value = i == kItemRepairSpeed ? Tr(L"Game speed", L"Скорость игры") : Tr(L"Everything", L"Всё");
+        } else if (i == kItemBatteryTarget) {
+            r.toggle = false;
+            r.value = std::to_wstring(g_state.group.size()) + Tr(L" guns", L" орудий");
         } else if (i == kItemRepairSpeed) {
             r.toggle = false;
             const int level = std::clamp(g_state.repairLevel, 0, 3);
@@ -3008,7 +3196,8 @@ void ApplyRequests() {
                                                 nullptr, nullptr,  // repair speed / what
                                                 SetTrajectory, SetImpact, SetThreats, SetAimCalc, SetAutoAim,
                                                 SetEnemyOverlay, SetRadar, SetIntel, SetTimers, SetWeakEnemy, SetWeakOwn,
-                                                SetStats, SetRecord, nullptr, nullptr, nullptr};  // diagnostics, all off, pick target
+                                                SetStats, SetRecord, nullptr, nullptr, nullptr,  // diagnostics, all off, pick target
+                                                SetBattery, nullptr};  // battery: on, target + fire
     for (int i = 0; i < kItemCount; ++i) {
         const LONG r = g_ipc.TakeRequest(g_featureId[i]);
         if (!r) continue;
@@ -3133,13 +3322,15 @@ void Tick(HDC dc) {
         ExportStats();
     }
     if (offline) ApplyAutoAim(team);
+    UpdateGroup(team, offline);
     if (g_state.record) RecordSamples(team);
     if (g_state.wantDiagnostics) {
         g_state.wantDiagnostics = false;
         Diagnostics(team);
     }
 
-    const bool worldDraw = g_state.trajectory || g_state.enemyOverlay || g_state.threats || g_state.aimCalc || g_state.weakEnemy || g_state.weakOwn;
+    const bool worldDraw = g_state.trajectory || g_state.enemyOverlay || g_state.threats || g_state.aimCalc || g_state.weakEnemy || g_state.weakOwn ||
+                           !g_state.group.empty() || g_state.groupPointSet;
     const bool draw = worldDraw || g_state.menuOpen || g_state.radar || g_state.intel || g_state.stats;
     if (!draw) return;
     if (g_state.trajectory || g_state.menuOpen) RefreshTypes(team);
@@ -3158,6 +3349,7 @@ void Tick(HDC dc) {
         if (g_state.weakEnemy || g_state.weakOwn) DrawWeak();
         if (g_state.trajectory) DrawTrajectories(team);
         if (g_state.aimCalc) DrawAimGhost();
+        DrawGroup();
         if (g_state.enemyOverlay) DrawEnemies(w, h);
         if (g_state.threats) DrawThreats(w);
     }
