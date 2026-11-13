@@ -100,8 +100,8 @@
 | Параметр | Значение |
 |---|---|
 | Игра | Forts, Steam App ID 410900 |
-| Сборка | Steam buildid 26181732 |
-| Проверка | `TimeDateStamp 0x6ADC9FAD`, `SizeOfImage 0x9D3000` |
+| Сборка | Steam buildid 26581374 |
+| Проверка | `TimeDateStamp 0x6AF3D1A6`, `SizeOfImage 0x9D2000` |
 | Система | Windows x64 |
 
 Хаб сверяет сборку перед загрузкой модуля и откажется работать с другой версией игры. После обновления Forts адреса нужно измерить заново. Все значения, зависящие от сборки, лежат в [`modules/forts/FortsConfig.hpp`](modules/forts/FortsConfig.hpp).
