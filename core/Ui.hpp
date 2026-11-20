@@ -18,12 +18,12 @@ namespace aero::ui {
 using Gdiplus::Color;
 using Gdiplus::RectF;
 
-// Dark (OLED) surfaces, calm blue accent, semantic status colors that are always paired with text.
-inline constexpr COLORREF kBg = RGB(14, 17, 22), kSidebar = RGB(18, 21, 28), kSurface = RGB(22, 26, 34),
-                          kSurface2 = RGB(31, 36, 47), kBorder = RGB(43, 49, 62), kText = RGB(232, 235, 242),
-                          kDim = RGB(152, 162, 179), kAccent = RGB(37, 99, 235), kAccentHover = RGB(59, 120, 245),
-                          kAccentRing = RGB(96, 165, 250), kOk = RGB(52, 211, 153), kWarn = RGB(251, 191, 36),
-                          kBad = RGB(248, 113, 113), kTrack = RGB(64, 72, 90);
+// Graphite surfaces and one amber accent (the aim dot of the app icon); semantic colors are always paired with text.
+inline constexpr COLORREF kBg = RGB(14, 15, 17), kSidebar = RGB(18, 19, 22), kSurface = RGB(23, 24, 27),
+                          kSurface2 = RGB(31, 33, 37), kBorder = RGB(40, 42, 47), kText = RGB(236, 237, 239),
+                          kDim = RGB(155, 158, 166), kAccent = RGB(245, 184, 61), kAccentHover = RGB(250, 199, 94),
+                          kAccentRing = RGB(245, 184, 61), kOk = RGB(94, 196, 140), kWarn = RGB(232, 176, 72),
+                          kBad = RGB(228, 112, 104), kTrack = RGB(56, 59, 66), kOnAccent = RGB(24, 20, 12);
 
 inline Color Col(COLORREF c, BYTE a = 255) { return Color(a, GetRValue(c), GetGValue(c), GetBValue(c)); }
 
@@ -86,7 +86,7 @@ inline float DrawPill(Gdiplus::Graphics& g, float scale, const Gdiplus::Font& fo
 
 inline void DrawSwitch(Gdiplus::Graphics& g, float scale, const RectF& r, bool on, bool enabled, bool hover) {
     const BYTE a = enabled ? 255 : 110;
-    FillRR(g, r, r.Height / 2, on ? (hover ? kAccentHover : kAccent) : (hover ? RGB(78, 87, 108) : kTrack), a);
+    FillRR(g, r, r.Height / 2, on ? (hover ? kAccentHover : kAccent) : (hover ? RGB(70, 73, 81) : kTrack), a);
     const float d = r.Height - 8 * scale;
     const float cx = on ? r.X + r.Width - 4 * scale - d / 2 : r.X + 4 * scale + d / 2;
     FillDot(g, cx, r.Y + r.Height / 2, d / 2, RGB(255, 255, 255), a);
@@ -98,15 +98,15 @@ inline void DrawButton(Gdiplus::Graphics& g, float scale, const Gdiplus::Font& f
     if (!enabled) {
         FillRR(g, r, rad, kSurface2, 160);
         StrokeRR(g, r, rad, kBorder);
-        DrawStr(g, label, font, r, RGB(112, 121, 138), Gdiplus::StringAlignmentCenter);
+        DrawStr(g, label, font, r, RGB(110, 113, 121), Gdiplus::StringAlignmentCenter);
         return;
     }
-    const COLORREF fill = primary ? (pressed ? RGB(29, 78, 190) : (hover ? kAccentHover : kAccent))
-                                  : (pressed ? kBorder : (hover ? RGB(40, 46, 60) : kSurface2));
+    const COLORREF fill = primary ? (pressed ? RGB(214, 158, 46) : (hover ? kAccentHover : kAccent))
+                                  : (pressed ? kBorder : (hover ? RGB(42, 44, 50) : kSurface2));
     FillRR(g, r, rad, fill);
     if (!primary) StrokeRR(g, r, rad, kBorder);
     if (focus) StrokeRR(g, RectF(r.X - 2, r.Y - 2, r.Width + 4, r.Height + 4), rad + 2, kAccentRing, 2.0f);
-    DrawStr(g, label, font, r, primary ? RGB(255, 255, 255) : kText, Gdiplus::StringAlignmentCenter);
+    DrawStr(g, label, font, r, primary ? kOnAccent : kText, Gdiplus::StringAlignmentCenter);
 }
 
 }  // namespace aero::ui

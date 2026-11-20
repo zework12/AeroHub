@@ -20,6 +20,7 @@ add_library(AeroCore STATIC
   core/Inject.cpp
   core/Profile.cpp
   core/Minecraft.cpp
+  core/SlimeRancher.cpp
   core/Diagnostics.cpp
   core/IatHook.cpp
   core/Ipc.cpp
@@ -53,6 +54,7 @@ set_target_properties(FortsModule PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${OUT}/mo
 
 add_custom_command(TARGET AeroHub POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/profiles" "${OUT}/profiles"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/hub/art" "${OUT}/art"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/modules/forts/FortsModule.ini" "${OUT}/modules/FortsModule.ini")
 
 # The Minecraft mod jar (built separately in modules/minecraft with `gradlew build`) travels with the hub, so the hub can

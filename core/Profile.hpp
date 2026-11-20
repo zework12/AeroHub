@@ -11,6 +11,7 @@ namespace aero {
 enum class GameKind {
     NativeModule,  // a DLL injected into the game process
     FabricMod,     // a mod jar the hub installs into a Minecraft (Fabric) instance
+    SlimeRancher,  // one tab for Slime Rancher 1 and 2: the hub finds the Steam install of the chosen part
 };
 
 struct GameProfile {

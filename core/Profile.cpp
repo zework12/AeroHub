@@ -31,6 +31,7 @@ std::vector<GameProfile> LoadProfiles(const std::filesystem::path& dir, std::vec
         if (it->path().extension() != L".ini") continue;
         const std::wstring file = std::filesystem::absolute(it->path()).wstring();
 
+        if (ReadKey(file, L"Hidden") == L"1") continue;  // kept in the app, not shown
         GameProfile p;
         p.file = it->path();
         p.name = ReadKey(file, L"Name");
@@ -39,6 +40,15 @@ std::vector<GameProfile> LoadProfiles(const std::filesystem::path& dir, std::vec
         p.note = ReadKey(file, L"BuildNote");
         p.hotkeys = ReadKey(file, L"Hotkeys");
         p.steamAppId = ReadKey(file, L"SteamAppId");
+        if (ReadKey(file, L"Kind") == L"SlimeRancher") {
+            p.kind = GameKind::SlimeRancher;
+            if (!p.name.empty()) {
+                result.push_back(std::move(p));
+            } else {
+                errors.push_back(it->path().filename().wstring() + L": a SlimeRancher profile needs Name");
+            }
+            continue;
+        }
         if (ReadKey(file, L"Kind") == L"FabricMod") {
             p.kind = GameKind::FabricMod;
             p.modFile = ReadKey(file, L"ModFile");

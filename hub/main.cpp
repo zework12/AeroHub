@@ -16,19 +16,23 @@
 #include <shlobj.h>
 #include <uxtheme.h>
 
+#include <cmath>
 #include <cstdio>
+#include <map>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include "Diagnostics.hpp"
 #include "Inject.hpp"
 #include "Ipc.hpp"
 #include "Minecraft.hpp"
+#include "SlimeRancher.hpp"
 #include "Pe.hpp"
 #include "Process.hpp"
 #include "Profile.hpp"
@@ -72,7 +76,7 @@ struct Link {
     Level level = Level::Idle;
 };
 
-enum class Act { None, SelectGame, Primary, Secondary, Refresh, AutoSwitch, TabModule, TabHub, CollectLogs, SwitchOpenGl, Update, LangEn, LangRu };
+enum class Act { None, SelectGame, Primary, Secondary, Refresh, AutoSwitch, TabModule, TabHub, CollectLogs, SwitchOpenGl, Update, LangEn, LangRu, SrPart, LogToggle, WinMin, WinMax, WinClose };
 struct Hit {
     RectF r;
     Act act = Act::None;
@@ -98,6 +102,14 @@ struct McState {
     std::wstring message;
     std::filesystem::path savedJar;
 } g_mc;
+
+// The Slime Rancher tab: which part is chosen (1 or 2) and what the Steam search found for it.
+struct SrState {
+    int part = 1;
+    bool found = false;
+    aero::sr::Install install;
+    int ticksSinceSearch = 0;
+} g_sr;
 std::vector<Status> g_status;
 std::vector<DWORD> g_autoTriedPid;
 int g_sel = 0;
@@ -437,8 +449,23 @@ Status EvaluateMinecraft(const aero::GameProfile& p) {
     return s;
 }
 
+// The Slime Rancher tab: no module yet. It says whether the chosen part is installed and that the cheats are not built.
+Status EvaluateSlimeRancher() {
+    Status s;
+    const std::wstring title = aero::sr::Title(g_sr.part);
+    if (g_sr.found) {
+        s.word = Tr(L"Game found", L"Игра найдена");
+        s.text = title + Tr(L" is installed. Cheats are not built yet: they need the game to be measured.", L" установлена. Читов пока нет: их нужно делать на самой игре.");
+    } else {
+        s.word = Tr(L"Not found", L"Не найдена");
+        s.text = title + Tr(L" was not found in your Steam libraries.", L" не найдена в библиотеках Steam.");
+    }
+    return s;
+}
+
 Status Evaluate(const aero::GameProfile& p) {
     if (p.kind == aero::GameKind::FabricMod) return EvaluateMinecraft(p);
+    if (p.kind == aero::GameKind::SlimeRancher) return EvaluateSlimeRancher();
     Status s;
     const auto dll = g_dir / p.moduleDll;
     std::error_code ec;
@@ -501,6 +528,13 @@ void UpdateChannel() {
         return;
     }
     const int sel = SelectedProfile();
+    if (sel >= 0 && g_profiles[sel].kind == aero::GameKind::SlimeRancher) {
+        g_client.Close();
+        g_clientPid = 0;
+        g_infoRows.clear();
+        g_link = {Tr(L"Offline", L"Не в сети"), Level::Idle};
+        return;
+    }
     if (sel >= 0 && g_profiles[sel].kind == aero::GameKind::FabricMod) {
         g_client.Close();
         g_clientPid = 0;
@@ -775,15 +809,38 @@ PrimaryState GetPrimary() {
     if (sel < 0) return {Tr(L"No game", L"Нет игры"), false};
     const Status& s = g_status[sel];
     if (g_profiles[sel].kind == aero::GameKind::FabricMod) return {Tr(L"Auto-detect Minecraft", L"Найти Minecraft"), true};
+    if (g_profiles[sel].kind == aero::GameKind::SlimeRancher) return {Tr(L"Find game", L"Найти игру"), true};
     if (s.canInject) return {Tr(L"Inject module", L"Внедрить модуль"), true};
     if (s.level == Level::Idle && s.pid == 0 && !g_profiles[sel].steamAppId.empty()) return {Tr(L"Launch game", L"Запустить игру"), true};
     if (s.level == Level::Active) return {Tr(L"Module active", L"Модуль активен"), false};
     return {Tr(L"Unavailable", L"Недоступно"), false};
 }
 
+void DetectSlimeRancher() {
+    const auto found = aero::sr::Find(g_sr.part);
+    g_sr.found = found.has_value();
+    g_sr.install = found.value_or(aero::sr::Install{});
+    g_sr.ticksSinceSearch = 0;
+    Log(std::wstring(L"Slime Rancher: ") + aero::sr::Title(g_sr.part) + (found ? L" found in " + found->dir.wstring() : std::wstring(L" not found in the Steam libraries")));
+}
+
+// Not found yet: look again every 15 seconds, so a game installed while the hub is open shows up.
+void PollSlimeRancher() {
+    if (g_sr.found || ++g_sr.ticksSinceSearch < 15) return;
+    DetectSlimeRancher();
+}
+
 void DoSecondary() {
     const int sel = SelectedProfile();
-    if (sel < 0 || g_profiles[sel].kind != aero::GameKind::FabricMod) return;
+    if (sel < 0) return;
+    if (g_profiles[sel].kind == aero::GameKind::SlimeRancher) {
+        if (g_sr.found && !g_sr.install.appId.empty()) {
+            ShellExecuteW(g_hwnd, L"open", (L"steam://rungameid/" + g_sr.install.appId).c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            Log(std::wstring(L"Slime Rancher: launching ") + aero::sr::Title(g_sr.part) + L" through Steam");
+        }
+        return;
+    }
+    if (g_profiles[sel].kind != aero::GameKind::FabricMod) return;
     SaveMod();
 }
 
@@ -792,6 +849,11 @@ void DoPrimary() {
     if (sel < 0) return;
     if (g_profiles[sel].kind == aero::GameKind::FabricMod) {
         AutoDetect();
+        Refresh();
+        return;
+    }
+    if (g_profiles[sel].kind == aero::GameKind::SlimeRancher) {
+        DetectSlimeRancher();
         Refresh();
         return;
     }
@@ -826,7 +888,9 @@ void PollModuleLog() {
         g_tailPos = 0;
         g_tailPath.clear();
         if (sel >= 0) {
-            if (g_profiles[sel].kind == aero::GameKind::FabricMod) {
+            if (g_profiles[sel].kind == aero::GameKind::SlimeRancher) {
+                g_tailPath.clear();  // no module, no log
+            } else if (g_profiles[sel].kind == aero::GameKind::FabricMod) {
                 g_tailPath = g_mc.found ? g_mc.game.dir / L"logs" / L"latest.log" : std::filesystem::path();
             } else {
                 g_tailPath = g_dir / g_profiles[sel].moduleDll;
@@ -860,256 +924,683 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Hub", L"AutoInject", g_autoInject ? L"1" : L"0", g_settingsFile.c_str());
 }
 
+std::unique_ptr<Gdiplus::Font> g_fSmallBold, g_fMonoSmall, g_fHero, g_fTile;
+
+// ---------------------------------------------------------------- theme
+// Palette taken from the app icon: near-black navy surfaces, blue-to-violet accent, cyan highlight.
+namespace th {
+// Graphite ramp for every surface, border and text; one amber accent (the aim dot of the icon) for the primary action,
+// the selection and live states. Colour otherwise lives only in the game art.
+constexpr COLORREF bg = RGB(14, 15, 17), side = RGB(18, 19, 22), card = RGB(23, 24, 27), card2 = RGB(31, 33, 37),
+                   line = RGB(40, 42, 47), lineHi = RGB(56, 59, 66), text = RGB(236, 237, 239), dim = RGB(155, 158, 166),
+                   faint = RGB(106, 109, 118), accent = RGB(245, 184, 61), accentHi = RGB(250, 199, 94), onAccent = RGB(24, 20, 12),
+                   ok = RGB(94, 196, 140), warn = RGB(232, 176, 72), bad = RGB(228, 112, 104), logBg = RGB(17, 18, 21);
+constexpr COLORREF blue = accent, violet = accent, cyan = accent;  // former hues, now the single accent
+}
+
+COLORREF Mix(COLORREF a, COLORREF b, float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    auto ch = [&](int x, int y) { return static_cast<BYTE>(x + (y - x) * t + 0.5f); };
+    return RGB(ch(GetRValue(a), GetRValue(b)), ch(GetGValue(a), GetGValue(b)), ch(GetBValue(a), GetBValue(b)));
+}
+BYTE A(float a) { return static_cast<BYTE>(std::clamp(a, 0.0f, 1.0f) * 255.0f + 0.5f); }
+
+COLORREF StatusColor(Level l) {
+    switch (l) {
+        case Level::Active: return th::ok;
+        case Level::Ready: return th::accent;
+        case Level::Bad: return th::bad;
+        default: return th::faint;
+    }
+}
+
+// Two colors per game for its tile and banner.
+void GameHue(const aero::GameProfile& p, COLORREF& c1, COLORREF& c2) {
+    if (p.kind == aero::GameKind::FabricMod) { c1 = RGB(34, 197, 94); c2 = RGB(13, 148, 136); return; }
+    if (p.kind == aero::GameKind::SlimeRancher) { c1 = RGB(236, 72, 153); c2 = RGB(168, 85, 247); return; }
+    if (_wcsicmp(p.processName.c_str(), L"Forts.exe") == 0) { c1 = RGB(249, 115, 22); c2 = RGB(220, 38, 38); return; }
+    c1 = th::blue;
+    c2 = th::violet;
+}
+
+// ---------------------------------------------------------------- animation
+// Every animated value is a key -> eased float. A frame advances them all by the real elapsed time; while any value has
+// not settled the window keeps a ~60 fps timer, otherwise the timer stops and the hub idles at zero cost.
+constexpr UINT_PTR kAnimTimer = 2;
+double g_now = 0, g_lastFrame = 0, g_appStart = 0, g_pageStart = -10;
+float g_dt = 1.0f / 60.0f;
+bool g_animating = false, g_pulsing = false;
+UINT g_animInterval = 0;
+bool g_logOpen = true;
+std::map<std::uint64_t, float> g_springs;
+
+double NowSec() {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return static_cast<double>(c.QuadPart) / static_cast<double>(f.QuadPart);
+}
+
+std::uint64_t Key(int kind, int a = 0, int b = 0) {
+    return (static_cast<std::uint64_t>(kind) << 48) | (static_cast<std::uint64_t>(a & 0xFFFFFF) << 24) | static_cast<std::uint64_t>(b & 0xFFFFFF);
+}
+
+// Moves the value toward `target` (exponential ease; `rate` is how fast, per second). A new key starts at `start`.
+float Ease(std::uint64_t key, float target, float rate = 14.0f, float start = -1.0f) {
+    auto it = g_springs.find(key);
+    if (it == g_springs.end()) it = g_springs.emplace(key, start < 0 ? target : start).first;
+    float& v = it->second;
+    v += (target - v) * (1.0f - std::exp(-rate * g_dt));
+    if (std::fabs(target - v) < 0.0015f) v = target;
+    else g_animating = true;
+    return v;
+}
+
+float Smooth(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return t * t * (3 - 2 * t);
+}
+float EaseOutCubic(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    return 1 - (1 - t) * (1 - t) * (1 - t);
+}
+
+// 0..1 progress of something that started at `start` and lasts `len` seconds (keeps frames coming until done).
+float Progress(double start, double len) {
+    const float t = static_cast<float>((g_now - start) / len);
+    if (t < 1.0f) g_animating = true;
+    return std::clamp(t, 0.0f, 1.0f);
+}
+
+bool IsHover(Act a, int idx) { return g_hoverAct == a && g_hoverIdx == idx; }
+bool IsPressed(Act a, int idx) { return g_pressAct == a && g_pressIdx == idx && IsHover(a, idx); }
+float HoverT(Act a, int idx) { return Ease(Key(1, static_cast<int>(a), idx + 1), IsHover(a, idx) ? 1.0f : 0.0f, 16.0f); }
+float PressT(Act a, int idx) { return Ease(Key(2, static_cast<int>(a), idx + 1), IsPressed(a, idx) ? 1.0f : 0.0f, 28.0f); }
+
+void AddHit(Act act, int idx, const RectF& r, bool enabled = true) { g_hits.push_back({r, act, idx, enabled}); }
+
+// ---------------------------------------------------------------- primitives
+void Text(Gdiplus::Graphics& g, const std::wstring& s, const Gdiplus::Font& f, const RectF& r, COLORREF c, float alpha = 1.0f,
+          Gdiplus::StringAlignment h = Gdiplus::StringAlignmentNear, Gdiplus::StringAlignment v = Gdiplus::StringAlignmentCenter,
+          bool wrap = false) {
+    if (alpha <= 0.01f) return;
+    Gdiplus::StringFormat fmt(wrap ? 0 : Gdiplus::StringFormatFlagsNoWrap);
+    fmt.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+    fmt.SetAlignment(h);
+    fmt.SetLineAlignment(v);
+    Gdiplus::SolidBrush b(Col(c, A(alpha)));
+    g.DrawString(s.c_str(), -1, &f, r, &fmt, &b);
+}
+
+RectF Inflate(const RectF& r, float d) { return RectF(r.X - d, r.Y - d, r.Width + 2 * d, r.Height + 2 * d); }
+
+void Fill(Gdiplus::Graphics& g, const RectF& r, float rad, COLORREF c, float alpha = 1.0f) {
+    if (alpha > 0.003f) FillRR(g, r, rad, c, A(alpha));
+}
+
+void Stroke(Gdiplus::Graphics& g, const RectF& r, float rad, COLORREF c, float alpha = 1.0f, float width = 1.0f) {
+    if (alpha > 0.003f) StrokeRR(g, r, rad, c, width, A(alpha));
+}
+
+void Grad(Gdiplus::Graphics& g, const RectF& r, float rad, COLORREF c1, COLORREF c2, float alpha = 1.0f, float angle = 20.0f) {
+    if (alpha <= 0.003f || r.Width <= 0 || r.Height <= 0) return;
+    Gdiplus::GraphicsPath p;
+    RoundPath(p, r, rad);
+    Gdiplus::LinearGradientBrush b(Inflate(r, 1), Col(c1, A(alpha)), Col(c2, A(alpha)), angle, TRUE);
+    g.FillPath(&b, &p);
+}
+
+// Soft glow / shadow: rings of decreasing opacity around a rounded rectangle. Rendered once per size and color into a
+// bitmap, then blitted (with the requested opacity), because dozens of anti-aliased path strokes per frame are slow.
+void Glow(Gdiplus::Graphics& g, const RectF& r, float rad, COLORREF c, float alpha, float spread) {
+    if (alpha <= 0.01f) return;
+    static std::map<std::tuple<int, int, int, int, COLORREF>, std::unique_ptr<Gdiplus::Bitmap>> cache;
+    const int w = static_cast<int>(r.Width + 0.5f), h = static_cast<int>(r.Height + 0.5f), sp = static_cast<int>(spread + 0.5f);
+    if (w <= 0 || h <= 0) return;
+    const auto key = std::make_tuple(w, h, static_cast<int>(rad + 0.5f), sp, c);
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        if (cache.size() > 64) cache.clear();
+        const int pad = sp + 2;
+        auto bmp = std::make_unique<Gdiplus::Bitmap>(w + pad * 2, h + pad * 2, PixelFormat32bppPARGB);
+        Gdiplus::Graphics bg(bmp.get());
+        bg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        const RectF inner(static_cast<float>(pad), static_cast<float>(pad), static_cast<float>(w), static_cast<float>(h));
+        const int steps = 6;
+        for (int i = 1; i <= steps; ++i) {
+            const float t = static_cast<float>(i) / steps;
+            StrokeRR(bg, Inflate(inner, spread * t), rad + spread * t, c, spread / steps + 1.0f, A((1 - t) * 0.35f));
+        }
+        it = cache.emplace(key, std::move(bmp)).first;
+    }
+    Gdiplus::Bitmap* bmp = it->second.get();
+    const float pad = static_cast<float>(sp + 2);
+    const RectF dst(r.X - pad, r.Y - pad, static_cast<float>(bmp->GetWidth()), static_cast<float>(bmp->GetHeight()));
+    if (alpha >= 0.995f) {
+        g.DrawImage(bmp, dst.X, dst.Y, dst.Width, dst.Height);
+        return;
+    }
+    Gdiplus::ColorMatrix cm = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, std::min(alpha, 1.0f), 0}, {0, 0, 0, 0, 1}}};
+    Gdiplus::ImageAttributes ia;
+    ia.SetColorMatrix(&cm);
+    g.DrawImage(bmp, dst, 0, 0, dst.Width, dst.Height, Gdiplus::UnitPixel, &ia);
+}
+
+void Radial(Gdiplus::Graphics& g, float cx, float cy, float rx, float ry, COLORREF c, BYTE alpha) {
+    Gdiplus::GraphicsPath p;
+    p.AddEllipse(cx - rx, cy - ry, rx * 2, ry * 2);
+    Gdiplus::PathGradientBrush b(&p);
+    b.SetCenterColor(Col(c, alpha));
+    Gdiplus::Color edge = Col(c, 0);
+    int n = 1;
+    b.SetSurroundColors(&edge, &n);
+    g.FillPath(&b, &p);
+}
+
+// App icon (resource 1) at a pixel size.
+void DrawLogo(Gdiplus::Graphics& g, float x, float y, float size) {
+    static HICON icon = nullptr;
+    static int iconSize = 0;
+    const int px = static_cast<int>(size + 0.5f);
+    if (px != iconSize) {
+        if (icon) DestroyIcon(icon);
+        icon = static_cast<HICON>(LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(1), IMAGE_ICON, px, px, 0));
+        iconSize = px;
+    }
+    if (!icon) return;
+    const HDC dc = g.GetHDC();
+    DrawIconEx(dc, static_cast<int>(x + 0.5f), static_cast<int>(y + 0.5f), icon, px, px, 0, nullptr, DI_NORMAL);
+    g.ReleaseHDC(dc);
+}
+
+enum class BtnKind { Primary, Secondary, Ghost };
+
+// Button with hover lift, press sink, gradient and glow for the primary kind.
+void Button(Gdiplus::Graphics& g, const RectF& r0, const std::wstring& label, BtnKind kind, bool enabled, Act act, int idx = 0,
+            float alpha = 1.0f) {
+    AddHit(act, idx, r0, enabled);
+    const float h = enabled ? HoverT(act, idx) : 0.0f, p = enabled ? PressT(act, idx) : 0.0f;
+    RectF r = r0;
+    r.Y += -S(1.5f) * h + S(1.0f) * p;
+    const float rad = S(10);
+    const float a = alpha * (enabled ? 1.0f : 0.45f);
+    if (kind == BtnKind::Primary) {
+        Fill(g, r, rad, Mix(th::accent, th::accentHi, h), a);
+        Fill(g, r, rad, RGB(0, 0, 0), a * 0.15f * p);
+        Text(g, label, *g_fBodyBold, r, th::onAccent, a, Gdiplus::StringAlignmentCenter);
+    } else if (kind == BtnKind::Secondary) {
+        Fill(g, r, rad, Mix(th::card2, th::lineHi, 0.35f * h), a);
+        Stroke(g, r, rad, Mix(th::line, th::lineHi, h), a);
+        Fill(g, r, rad, RGB(0, 0, 0), a * 0.15f * p);
+        Text(g, label, *g_fBodyBold, r, th::text, a, Gdiplus::StringAlignmentCenter);
+    } else {
+        Fill(g, r, rad, th::card2, a * h);
+        Text(g, label, *g_fBody, r, Mix(th::dim, th::text, h), a, Gdiplus::StringAlignmentCenter);
+    }
+}
+
+// Switch whose knob slides and whose track fills with the accent gradient.
+void Toggle(Gdiplus::Graphics& g, const RectF& r, bool on, Act act, int idx = 0) {
+    const float t = Ease(Key(3, static_cast<int>(act), idx), on ? 1.0f : 0.0f, 12.0f);
+    const float h = HoverT(act, idx);
+    Fill(g, r, r.Height / 2, Mix(th::line, th::lineHi, h * 0.6f));
+    if (t > 0.01f) {
+        Fill(g, r, r.Height / 2, th::accent, t);
+    }
+    const float d = r.Height - S(6);
+    const float cx = r.X + S(3) + d / 2 + (r.Width - S(6) - d) * EaseOutCubic(t);
+    const float grow = S(1.5f) * h;
+    FillDot(g, cx, r.Y + r.Height / 2, d / 2 + grow, Mix(th::text, th::onAccent, t * 0.0f));
+}
+
+// Segmented control with a thumb that slides to the chosen segment.
+void Segmented(Gdiplus::Graphics& g, const RectF& r, const std::vector<std::wstring>& labels, int selected, Act act, int idxBase,
+               std::uint64_t key, float alpha = 1.0f) {
+    const int n = static_cast<int>(labels.size());
+    if (n == 0) return;
+    Fill(g, r, S(10), th::bg, alpha);
+    Stroke(g, r, S(10), th::line, alpha);
+    const float pad = S(3), w = (r.Width - pad * 2) / n;
+    const float pos = Ease(key, static_cast<float>(selected), 13.0f);
+    const RectF thumb(r.X + pad + w * pos, r.Y + pad, w, r.Height - pad * 2);
+    Fill(g, thumb, S(8), th::card2, alpha);
+    Stroke(g, thumb, S(8), th::lineHi, alpha);
+    for (int i = 0; i < n; ++i) {
+        const RectF cell(r.X + pad + w * i, r.Y + pad, w, r.Height - pad * 2);
+        const float h = HoverT(act, idxBase + i);
+        const float on = std::clamp(1.0f - std::fabs(pos - i), 0.0f, 1.0f);
+        Text(g, labels[static_cast<std::size_t>(i)], *g_fSmallBold, cell, Mix(Mix(th::faint, th::dim, h), th::text, on), alpha,
+             Gdiplus::StringAlignmentCenter);
+        AddHit(act, idxBase + i, cell);
+    }
+}
+
+// Status chip: dot (pulsing while the module is active) and word.
+float Chip(Gdiplus::Graphics& g, float x, float y, const std::wstring& word, Level level, float alpha = 1.0f) {
+    const COLORREF c = StatusColor(level);
+    const float hgt = S(28), dot = S(4);
+    const float w = S(14) * 2 + dot * 2 + S(9) + MeasureW(g, word, *g_fSmallBold);
+    const RectF r(x, y, w, hgt);
+    Fill(g, r, hgt / 2, c, 0.12f * alpha);
+    Stroke(g, r, hgt / 2, c, 0.35f * alpha);
+    const float cx = x + S(14) + dot, cy = y + hgt / 2;
+    if (level == Level::Active) {
+        g_pulsing = true;
+        const float ph = static_cast<float>(std::fmod(g_now * 0.9, 1.0));
+        FillDot(g, cx, cy, dot + S(7) * ph, c, A(alpha * 0.45f * (1 - ph)));
+    }
+    FillDot(g, cx, cy, dot, c, A(alpha));
+    Text(g, word, *g_fSmallBold, RectF(cx + dot + S(9), y, w, hgt), c, alpha);
+    return w;
+}
+
+void Card(Gdiplus::Graphics& g, const RectF& r, float alpha = 1.0f) {
+    Fill(g, r, S(16), th::card, alpha);
+    Stroke(g, r, S(16), th::line, alpha);
+}
+
+void CardTitle(Gdiplus::Graphics& g, const RectF& c, const std::wstring& title, COLORREF, float alpha) {
+    Text(g, title, *g_fH2, RectF(c.X + S(24), c.Y + S(16), c.Width - S(48), S(30)), th::text, alpha);
+}
+
+// Key hint "Insert = open the menu": the key in a keycap, the action after it.
+void HintRow(Gdiplus::Graphics& g, const RectF& r, const std::wstring& line, float alpha) {
+    const std::size_t eq = line.find(L" = ");
+    if (eq == std::wstring::npos) {
+        FillDot(g, r.X + S(6), r.Y + r.Height / 2, S(3), th::cyan, A(alpha));
+        Text(g, line, *g_fSmall, RectF(r.X + S(20), r.Y, r.Width - S(20), r.Height), th::dim, alpha);
+        return;
+    }
+    const std::wstring key = line.substr(0, eq), what = line.substr(eq + 3);
+    const float kw = std::min(r.Width * 0.45f, MeasureW(g, key, *g_fMonoSmall) + S(20));
+    const RectF cap(r.X, r.Y + (r.Height - S(26)) / 2, kw, S(26));
+    Fill(g, RectF(cap.X, cap.Y + S(2), cap.Width, cap.Height), S(7), RGB(0, 0, 0), alpha * 0.5f);
+    Fill(g, cap, S(7), th::card2, alpha);
+    Stroke(g, cap, S(7), th::lineHi, alpha);
+    Text(g, key, *g_fMonoSmall, cap, th::text, alpha, Gdiplus::StringAlignmentCenter);
+    Text(g, what, *g_fSmall, RectF(cap.X + kw + S(12), r.Y, r.Width - kw - S(12), r.Height), th::dim, alpha);
+}
+
 // ---------------------------------------------------------------- layout
 struct Lay {
-    RectF sidebar, header, guide, live, log, logTabs, logBody;
-    float margin = 0, gap = 0;
+    RectF sidebar, content, hero, guide, live, log, logBody;
 };
 
-Lay Compute(int w, int h) {
+float LogHeightOpen(float H) { return std::clamp(H * 0.30f, S(180), S(290)); }
+
+Lay Compute(int w, int h, float logOpenT) {
     Lay L;
     const float W = static_cast<float>(w), H = static_cast<float>(h);
-    const float sb = S(244), m = S(24), gap = S(16);
-    L.margin = m;
-    L.gap = gap;
+    const float sb = S(264), m = S(26), gap = S(18);
     L.sidebar = RectF(0, 0, sb, H);
-    const float x0 = sb + m, cw = max(S(200), W - sb - 2 * m);
-    float y = m;
-    L.header = RectF(x0, y, cw, S(84));
-    y += S(84) + S(12);
-    float logH = std::clamp(H * 0.32f, S(190), S(300));
-    float cardsH = H - y - m - gap - logH;
-    if (cardsH < S(210)) {
-        cardsH = S(210);
-        logH = max(S(120), H - y - m - gap - cardsH);
-    }
+    const float x0 = sb + m, cw = std::max(S(300), W - sb - 2 * m);
+    L.content = RectF(x0, 0, cw, H);
+    float y = S(44);
+    L.hero = RectF(x0, y, cw, S(176));
+    y += S(176) + gap;
+    const float logH = S(58) + (LogHeightOpen(H) - S(58)) * logOpenT;
+    const float cardsH = std::max(S(170), H - y - m - gap - logH);
     const float leftW = cw * 0.58f - gap / 2;
     L.guide = RectF(x0, y, leftW, cardsH);
     L.live = RectF(x0 + leftW + gap, y, cw - leftW - gap, cardsH);
     y += cardsH + gap;
-    L.log = RectF(x0, y, cw, max(S(120), H - y - m));
-    L.logTabs = RectF(L.log.X + S(16), L.log.Y + S(12), S(260), S(32));
-    L.logBody = RectF(L.log.X + S(1), L.log.Y + S(56), L.log.Width - S(2), L.log.Height - S(57));
+    L.log = RectF(x0, y, cw, std::max(S(58), H - y - m));
+    L.logBody = RectF(L.log.X + S(14), L.log.Y + S(58), L.log.Width - S(28), L.log.Height - S(70));
     return L;
 }
+
+float g_logOpenT = 1.0f;  // eased 0..1, read by PositionLogs between frames
 
 void PositionLogs() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
-    const Lay L = Compute(rc.right, rc.bottom);
-    const int x = static_cast<int>(L.logBody.X + S(12)), y = static_cast<int>(L.logBody.Y),
-              w = static_cast<int>(L.logBody.Width - S(24)), h = static_cast<int>(L.logBody.Height - S(8));
+    const Lay L = Compute(rc.right, rc.bottom, g_logOpenT);
+    const bool show = L.logBody.Height > S(30);
+    const int x = static_cast<int>(L.logBody.X + S(6)), y = static_cast<int>(L.logBody.Y),
+              w = static_cast<int>(L.logBody.Width - S(12)), h = static_cast<int>(std::max(0.0f, L.logBody.Height));
     MoveWindow(g_editModule, x, y, w, h, TRUE);
     MoveWindow(g_editHub, x, y, w, h, TRUE);
-    ShowWindow(g_editModule, g_tab == 0 ? SW_SHOW : SW_HIDE);
-    ShowWindow(g_editHub, g_tab == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_editModule, show && g_tab == 0 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_editHub, show && g_tab == 1 ? SW_SHOW : SW_HIDE);
 }
 
 void MakeFonts() {
-    auto mk = [](const wchar_t* fam, float px, int style) {
-        return std::make_unique<Gdiplus::Font>(fam, S(px), style, Gdiplus::UnitPixel);
+    auto family = [](std::initializer_list<const wchar_t*> names) {
+        for (const wchar_t* n : names) {
+            Gdiplus::FontFamily f(n);
+            if (f.IsAvailable()) return std::wstring(n);
+        }
+        return std::wstring(L"Segoe UI");
     };
-    g_fTitle = mk(L"Segoe UI", 24, Gdiplus::FontStyleBold);
-    g_fH2 = mk(L"Segoe UI", 15, Gdiplus::FontStyleBold);
-    g_fBody = mk(L"Segoe UI", 14, Gdiplus::FontStyleRegular);
-    g_fBodyBold = mk(L"Segoe UI", 14, Gdiplus::FontStyleBold);
-    g_fSmall = mk(L"Segoe UI", 12, Gdiplus::FontStyleRegular);
-    g_fMono = mk(L"Consolas", 13, Gdiplus::FontStyleRegular);
-    g_fBrand = mk(L"Segoe UI", 18, Gdiplus::FontStyleBold);
+    const std::wstring ui = L"Segoe UI";
+    const std::wstring semi = family({L"Segoe UI Semibold", L"Segoe UI"});
+    const std::wstring mono = family({L"Cascadia Mono", L"Consolas"});
+    auto mk = [](const std::wstring& fam, float px, int style) {
+        return std::make_unique<Gdiplus::Font>(fam.c_str(), S(px), style, Gdiplus::UnitPixel);
+    };
+    g_fHero = mk(semi, 32, Gdiplus::FontStyleRegular);
+    g_fTitle = mk(semi, 24, Gdiplus::FontStyleRegular);
+    g_fH2 = mk(semi, 16, Gdiplus::FontStyleRegular);
+    g_fBody = mk(ui, 14, Gdiplus::FontStyleRegular);
+    g_fBodyBold = mk(semi, 14, Gdiplus::FontStyleRegular);
+    g_fSmall = mk(ui, 12.5f, Gdiplus::FontStyleRegular);
+    g_fSmallBold = mk(semi, 12.5f, Gdiplus::FontStyleRegular);
+    g_fMono = mk(mono, 13, Gdiplus::FontStyleRegular);
+    g_fMonoSmall = mk(mono, 12, Gdiplus::FontStyleRegular);
+    g_fBrand = mk(semi, 19, Gdiplus::FontStyleRegular);
+    g_fTile = mk(semi, 18, Gdiplus::FontStyleRegular);
     if (g_editFont) DeleteObject(g_editFont);
     g_editFont = CreateFontW(-static_cast<int>(S(13)), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
-                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, L"Consolas");
+                             CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, mono.c_str());
     if (g_editHub) SendMessageW(g_editHub, WM_SETFONT, reinterpret_cast<WPARAM>(g_editFont), TRUE);
     if (g_editModule) SendMessageW(g_editModule, WM_SETFONT, reinterpret_cast<WPARAM>(g_editFont), TRUE);
 }
 
-// ---------------------------------------------------------------- drawing primitives
-void AddHit(Act act, int idx, const RectF& r, bool enabled = true) { g_hits.push_back({r, act, idx, enabled}); }
+// ---------------------------------------------------------------- background (cached per window size)
+std::unique_ptr<Gdiplus::Bitmap> g_bgCache;
+int g_bgW = 0, g_bgH = 0, g_bgDpi = 0;
 
-bool IsHover(Act a, int idx) { return g_hoverAct == a && g_hoverIdx == idx; }
-bool IsPressed(Act a, int idx) { return g_pressAct == a && g_pressIdx == idx && IsHover(a, idx); }
-
-// Thin wrappers: the drawing itself lives in core/Ui.hpp and is shared with the in-game menu.
-float DrawPill(Gdiplus::Graphics& g, float x, float y, const std::wstring& text, COLORREF c) {
-    return aero::ui::DrawPill(g, S(1), *g_fSmall, x, y, text, c);
+Gdiplus::Bitmap* Background(int w, int h) {
+    if (!g_bgCache || g_bgW != w || g_bgH != h || g_bgDpi != g_dpi) {
+        g_bgCache = std::make_unique<Gdiplus::Bitmap>(w, h, PixelFormat32bppPARGB);
+        g_bgW = w;
+        g_bgH = h;
+        g_bgDpi = g_dpi;
+        Gdiplus::Graphics g(g_bgCache.get());
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.Clear(Col(th::bg));
+        const float H = static_cast<float>(h), sb = S(264);
+        Gdiplus::SolidBrush side(Col(th::side));
+        g.FillRectangle(&side, RectF(0, 0, sb, H));
+        Gdiplus::SolidBrush edge(Col(th::line));
+        g.FillRectangle(&edge, RectF(sb - 1, 0, 1, H));
+    }
+    return g_bgCache.get();
 }
 
-void DrawButton(Gdiplus::Graphics& g, const RectF& r, const std::wstring& label, bool primary, bool enabled, bool hover,
-                bool pressed, bool focus = false) {
-    aero::ui::DrawButton(g, S(1), *g_fBodyBold, r, label, primary, enabled, hover, pressed, focus);
+void DrawBackgroundRegion(Gdiplus::Graphics& g, const RectF& r, float alpha) {
+    if (!g_bgCache || alpha <= 0.01f) return;
+    Gdiplus::ColorMatrix cm = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, alpha, 0}, {0, 0, 0, 0, 1}}};
+    Gdiplus::ImageAttributes ia;
+    ia.SetColorMatrix(&cm);
+    g.DrawImage(g_bgCache.get(), r, r.X, r.Y, r.Width, r.Height, Gdiplus::UnitPixel, &ia);
 }
 
-void DrawSwitch(Gdiplus::Graphics& g, const RectF& r, bool on, bool enabled, bool hover) {
-    aero::ui::DrawSwitch(g, S(1), r, on, enabled, hover);
-}
-void DrawCard(Gdiplus::Graphics& g, const RectF& r) {
-    FillRR(g, r, S(12), kSurface);
-    StrokeRR(g, r, S(12), kBorder);
+// Game art from <hub>/art/<name>.jpg (generated banners); nullptr when the file is missing.
+Gdiplus::Bitmap* GameArt(const aero::GameProfile& p, bool icon = false) {
+    static std::map<std::wstring, std::unique_ptr<Gdiplus::Bitmap>> cache;
+    std::wstring name;
+    if (p.kind == aero::GameKind::FabricMod) name = L"minecraft";
+    else if (_wcsicmp(p.processName.c_str(), L"Forts.exe") == 0) name = L"forts";
+    else return nullptr;
+    if (icon) name += L"_icon";
+    auto it = cache.find(name);
+    if (it == cache.end()) {
+        auto bmp = std::make_unique<Gdiplus::Bitmap>((g_dir / L"art" / (name + L".jpg")).c_str());
+        if (bmp->GetLastStatus() != Gdiplus::Ok || bmp->GetWidth() == 0) bmp.reset();
+        it = cache.emplace(name, std::move(bmp)).first;
+    }
+    return it->second.get();
 }
 
-void DrawEmptyState(Gdiplus::Graphics& g, const RectF& r, const std::wstring& title, const std::wstring& hint) {
-    const float cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2 - S(20);
-    Gdiplus::Pen pen(Col(kBorder), S(2));
-    g.DrawEllipse(&pen, cx - S(18), cy - S(34), S(36), S(36));
-    FillDot(g, cx, cy - S(16), S(4), kDim);
-    DrawStr(g, title, *g_fH2, RectF(r.X + S(16), cy + S(12), r.Width - S(32), S(24)), kText, Gdiplus::StringAlignmentCenter);
-    DrawStr(g, hint, *g_fSmall, RectF(r.X + S(16), cy + S(38), r.Width - S(32), S(22)), kDim, Gdiplus::StringAlignmentCenter);
+// Draws `img` to cover `r` (cropped around `focusX` of the image width), clipped to a rounded rectangle. The scaled crop is
+// cached per size, so a still frame costs one plain blit instead of a high-quality resample of the whole picture.
+void DrawCover(Gdiplus::Graphics& g, Gdiplus::Bitmap* img, const RectF& r, float rad, float alpha, float focusX = 0.5f) {
+    if (!img || alpha <= 0.01f || r.Width < 1 || r.Height < 1) return;
+    struct Entry {
+        std::unique_ptr<Gdiplus::Bitmap> bmp;
+        ULONGLONG used = 0;
+    };
+    static std::map<std::tuple<const void*, int, int, int, int>, Entry> cache;
+    const int w = static_cast<int>(r.Width + 0.5f), h = static_cast<int>(r.Height + 0.5f);
+    const auto key = std::make_tuple(static_cast<const void*>(img), w, h, static_cast<int>(rad * 10), static_cast<int>(focusX * 100));
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        if (cache.size() > 24) cache.clear();  // sizes change while the window is resized
+        auto bmp = std::make_unique<Gdiplus::Bitmap>(w, h, PixelFormat32bppPARGB);
+        Gdiplus::Graphics bg(bmp.get());
+        bg.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        bg.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        bg.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
+        const float iw = static_cast<float>(img->GetWidth()), ih = static_cast<float>(img->GetHeight());
+        const float scale = std::max(w / iw, h / ih);
+        const float sw = w / scale, sh = h / scale;
+        const float sx = std::clamp(iw * focusX - sw / 2, 0.0f, iw - sw), sy = (ih - sh) / 2;
+        if (rad > 0) {
+            Gdiplus::GraphicsPath clip;
+            RoundPath(clip, RectF(0, 0, static_cast<float>(w), static_cast<float>(h)), rad);
+            bg.SetClip(&clip);
+        }
+        bg.DrawImage(img, RectF(0, 0, static_cast<float>(w), static_cast<float>(h)), sx, sy, sw, sh, Gdiplus::UnitPixel);
+        it = cache.emplace(key, Entry{std::move(bmp), 0}).first;
+    }
+    Gdiplus::Bitmap* scaled = it->second.bmp.get();
+    if (alpha >= 0.995f) {
+        g.DrawImage(scaled, r.X, r.Y, static_cast<float>(w), static_cast<float>(h));
+        return;
+    }
+    Gdiplus::ColorMatrix cm = {{{1, 0, 0, 0, 0}, {0, 1, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, alpha, 0}, {0, 0, 0, 0, 1}}};
+    Gdiplus::ImageAttributes ia;
+    ia.SetColorMatrix(&cm);
+    g.DrawImage(scaled, RectF(r.X, r.Y, static_cast<float>(w), static_cast<float>(h)), 0, 0, static_cast<float>(w), static_cast<float>(h),
+                Gdiplus::UnitPixel, &ia);
+}
+
+// Minimize / maximize / close, drawn by the app because the system title bar is removed.
+void DrawCaptionButtons(Gdiplus::Graphics& g, float W) {
+    const float bw = S(46), bh = S(34);
+    const Act acts[3] = {Act::WinMin, Act::WinMax, Act::WinClose};
+    for (int i = 0; i < 3; ++i) {
+        const RectF r(W - bw * (3 - i), 0, bw, bh);
+        AddHit(acts[i], 0, r);
+        const float h = HoverT(acts[i], 0);
+        if (h > 0.01f) {
+            Gdiplus::SolidBrush b(Col(i == 2 ? RGB(232, 17, 35) : th::card2, A(h)));
+            g.FillRectangle(&b, r);
+        }
+        Gdiplus::Pen pen(Col(Mix(th::dim, RGB(255, 255, 255), h)), S(1));
+        const float cx = r.X + r.Width / 2, cy = r.Y + r.Height / 2, d = S(5);
+        if (i == 0) {
+            g.DrawLine(&pen, cx - d, cy, cx + d, cy);
+        } else if (i == 1) {
+            if (IsZoomed(g_hwnd)) {
+                g.DrawRectangle(&pen, cx - d + S(2), cy - d, d * 2 - S(2), d * 2 - S(2));
+                g.DrawRectangle(&pen, cx - d, cy - d + S(2), d * 2 - S(2), d * 2 - S(2));
+            } else {
+                g.DrawRectangle(&pen, cx - d, cy - d, d * 2, d * 2);
+            }
+        } else {
+            g.DrawLine(&pen, cx - d, cy - d, cx + d, cy + d);
+            g.DrawLine(&pen, cx - d, cy + d, cx + d, cy - d);
+        }
+    }
 }
 
 // ---------------------------------------------------------------- screen
 void DrawSidebar(Gdiplus::Graphics& g, const Lay& L) {
-    FillRR(g, RectF(0, 0, 1, 1), 0, kSidebar, 0);  // keep GDI+ path warm; no visual effect
-    Gdiplus::SolidBrush sb(Col(kSidebar));
-    g.FillRectangle(&sb, L.sidebar);
-    Gdiplus::Pen edge(Col(kBorder), 1.0f);
-    g.DrawLine(&edge, L.sidebar.Width - 0.5f, 0.0f, L.sidebar.Width - 0.5f, L.sidebar.Height);
+    const float x = S(22);
+    const float intro = EaseOutCubic(Progress(g_appStart, 0.6));
+    DrawLogo(g, x, S(26) - S(8) * (1 - intro), S(42));
+    Text(g, L"AeroHub", *g_fBrand, RectF(x + S(54), S(24), S(170), S(26)), th::text, intro);
+    Text(g, Tr(L"Game tool hub", L"Хаб для игр"), *g_fSmall, RectF(x + S(54), S(48), S(170), S(20)), th::dim, intro);
 
-    const float x = S(20);
-    float y = S(24);
-    FillRR(g, RectF(x, y, S(36), S(36)), S(10), kAccent);
-    DrawStr(g, L"A", *g_fBrand, RectF(x, y, S(36), S(36)), RGB(255, 255, 255), Gdiplus::StringAlignmentCenter);
-    DrawStr(g, L"AeroHub", *g_fH2, RectF(x + S(48), y - S(2), S(150), S(22)), kText);
-    DrawStr(g, Tr(L"Game tool hub", L"Хаб для игр"), *g_fSmall, RectF(x + S(48), y + S(18), S(150), S(18)), kDim);
+    float y = S(100);
+    Text(g, Tr(L"GAMES", L"ИГРЫ"), *g_fSmallBold, RectF(x, y, S(150), S(20)), th::faint, intro);
+    y += S(28);
 
-    // Version and the update button next to it.
-    {
-        const float vy = y + S(52);
-        DrawStr(g, std::wstring(Tr(L"Version ", L"Версия ")) + aero::kAppVersion, *g_fSmall, RectF(x, vy + S(5), S(96), S(18)), kDim);
-        std::wstring label = Tr(L"Check updates", L"Обновления");
-        bool primary = false, enabled = !g_demo;
-        switch (UpdateNow()) {
-            case UpState::Checking: label = Tr(L"Checking...", L"Проверка..."); enabled = false; break;
-            case UpState::UpToDate: label = Tr(L"Up to date", L"Последняя"); break;
-            case UpState::Available: {
-                std::lock_guard<std::mutex> lock(g_upLock);
-                label = std::wstring(Tr(L"Update ", L"Обновить ")) + g_up.release.tag;
-                primary = true;
-                break;
-            }
-            case UpState::Downloading: label = Tr(L"Downloading...", L"Загрузка..."); enabled = false; break;
-            case UpState::Failed: label = Tr(L"Retry check", L"Повторить"); break;
-            case UpState::Idle: break;
-        }
-        const RectF btn(L.sidebar.Width - S(20) - S(124), vy, S(124), S(28));
-        DrawButton(g, btn, label, primary, enabled, IsHover(Act::Update, 0), IsPressed(Act::Update, 0));
-        AddHit(Act::Update, 0, btn, enabled);
-
-        // Interface language: two segments, the active one is filled.
-        const float ly = vy + S(40);
-        DrawStr(g, Tr(L"Language", L"Язык"), *g_fSmall, RectF(x, ly + S(5), S(96), S(18)), kDim);
-        const float seg = S(60);
-        const RectF en(L.sidebar.Width - S(20) - 2 * seg - S(4), ly, seg, S(28)), ru(L.sidebar.Width - S(20) - seg, ly, seg, S(28));
-        DrawButton(g, en, L"EN", g_lang == 0, true, IsHover(Act::LangEn, 0), IsPressed(Act::LangEn, 0));
-        DrawButton(g, ru, L"RU", g_lang == 1, true, IsHover(Act::LangRu, 0), IsPressed(Act::LangRu, 0));
-        AddHit(Act::LangEn, 0, en);
-        AddHit(Act::LangRu, 0, ru);
+    const float itemH = S(66), step = S(72);
+    // Selection highlight glides between items.
+    if (!g_profiles.empty()) {
+        const float selY = Ease(Key(10), y + step * static_cast<float>(std::max(0, g_sel)), 14.0f);
+        const RectF hl(S(12), selY, L.sidebar.Width - S(24), itemH);
+        Fill(g, hl, S(12), th::card2);
+        Stroke(g, hl, S(12), th::line);
+        Fill(g, RectF(hl.X + S(1), hl.Y + S(20), S(3), itemH - S(40)), S(1.5f), th::accent);
     }
-    y += S(146);
-    DrawStr(g, Tr(L"GAMES", L"ИГРЫ"), *g_fSmall, RectF(x, y, S(120), S(18)), kDim);
-    y += S(26);
-
     for (std::size_t i = 0; i < g_profiles.size(); ++i) {
-        const RectF r(S(12), y, L.sidebar.Width - S(24), S(58));
-        const bool sel = static_cast<int>(i) == g_sel, hov = IsHover(Act::SelectGame, static_cast<int>(i));
-        if (sel) FillRR(g, r, S(10), kSurface2);
-        else if (hov) FillRR(g, r, S(10), kSurface2, 120);
-        if (sel) FillRR(g, RectF(r.X, r.Y + S(12), S(3), r.Height - S(24)), S(1.5f), kAccentRing);
-        const COLORREF c = LevelColor(g_status[i].level);
-        FillDot(g, r.X + S(22), r.Y + r.Height / 2, S(5), c);
-        DrawStr(g, g_profiles[i].name, *g_fBodyBold, RectF(r.X + S(40), r.Y + S(8), r.Width - S(48), S(22)), kText);
-        DrawStr(g, StatusWord(i), *g_fSmall, RectF(r.X + S(40), r.Y + S(30), r.Width - S(48), S(20)), kDim);
-        AddHit(Act::SelectGame, static_cast<int>(i), r);
-        y += S(62);
+        const int ii = static_cast<int>(i);
+        const float appear = EaseOutCubic(Progress(g_appStart + 0.12 + 0.07 * ii, 0.45));
+        const RectF r(S(12) + S(18) * (1 - appear), y, L.sidebar.Width - S(24), itemH);
+        const float h = HoverT(Act::SelectGame, ii);
+        const bool sel = ii == g_sel;
+        if (!sel) Fill(g, r, S(12), th::card2, 0.6f * h * appear);
+        COLORREF c1, c2;
+        GameHue(g_profiles[i], c1, c2);
+        const RectF tile(r.X + S(12), r.Y + (itemH - S(42)) / 2 - S(1.5f) * h, S(42), S(42));
+        Grad(g, tile, S(12), c1, c2, appear, 45.0f);
+        if (Gdiplus::Bitmap* art = GameArt(g_profiles[i], true)) {
+            DrawCover(g, art, tile, S(12), appear, 0.5f);
+            Stroke(g, tile, S(12), RGB(255, 255, 255), 0.10f * appear);
+        } else {
+            Fill(g, RectF(tile.X + S(1), tile.Y + S(1), tile.Width - S(2), tile.Height * 0.45f), S(11), RGB(255, 255, 255), 0.12f * appear);
+            const std::wstring letter = g_profiles[i].name.empty() ? L"?" : g_profiles[i].name.substr(0, 1);
+            Text(g, letter, *g_fTile, tile, RGB(255, 255, 255), appear, Gdiplus::StringAlignmentCenter);
+        }
+        Text(g, g_profiles[i].name, *g_fBodyBold, RectF(tile.X + S(54), r.Y + S(12), r.Width - S(80), S(22)),
+             Mix(th::dim, th::text, sel ? 1.0f : 0.6f + 0.4f * h), appear);
+        const COLORREF sc = StatusColor(g_status[i].level);
+        FillDot(g, tile.X + S(58), r.Y + S(44), S(3.5f), sc, A(appear));
+        Text(g, StatusWord(i), *g_fSmall, RectF(tile.X + S(68), r.Y + S(34), r.Width - S(90), S(20)), th::dim, appear);
+        AddHit(Act::SelectGame, ii, r);
+        y += step;
     }
 
-    // Auto-inject switch pinned to the bottom.
-    const float by = L.sidebar.Height - S(104);
-    Gdiplus::Pen div(Col(kBorder), 1.0f);
-    g.DrawLine(&div, S(20), by, L.sidebar.Width - S(20), by);
-    DrawStr(g, Tr(L"Auto-inject", L"Автовнедрение"), *g_fBodyBold, RectF(x, by + S(14), S(150), S(22)), kText);
-    DrawStr(g, Tr(L"Loads the module a few seconds", L"Загрузит модуль через"), *g_fSmall, RectF(x, by + S(36), S(190), S(18)), kDim);
-    DrawStr(g, Tr(L"after the game starts", L"несколько секунд после старта"), *g_fSmall, RectF(x, by + S(52), S(190), S(18)), kDim);
-    const RectF sw(L.sidebar.Width - S(20) - S(44), by + S(16), S(44), S(24));
-    DrawSwitch(g, sw, g_autoInject, true, IsHover(Act::AutoSwitch, 0));
-    AddHit(Act::AutoSwitch, 0, RectF(x, by + S(8), L.sidebar.Width - 2 * x, S(70)));
+    // Bottom panel: auto-inject, language, version and update.
+    const float pw = L.sidebar.Width - S(24);
+    const RectF panel(S(12), L.sidebar.Height - S(196), pw, S(182));
+    Fill(g, panel, S(16), th::card, 0.9f * intro);
+    Stroke(g, panel, S(16), th::line, intro);
+    const float px = panel.X + S(16);
+    Text(g, Tr(L"Auto-inject", L"Автовнедрение"), *g_fBodyBold, RectF(px, panel.Y + S(14), S(160), S(22)), th::text, intro);
+    Text(g, Tr(L"Loads the module after start", L"Модуль сам после запуска"), *g_fSmall, RectF(px, panel.Y + S(36), S(170), S(18)), th::dim, intro);
+    Toggle(g, RectF(panel.X + pw - S(16) - S(46), panel.Y + S(20), S(46), S(26)), g_autoInject, Act::AutoSwitch);
+    AddHit(Act::AutoSwitch, 0, RectF(panel.X, panel.Y + S(6), pw, S(56)));
+
+    Segmented(g, RectF(px, panel.Y + S(70), pw - S(32), S(34)), {L"English", L"Русский"}, g_lang, Act::LangEn, 0, Key(11));
+
+    std::wstring label = Tr(L"Check updates", L"Обновления");
+    BtnKind kind = BtnKind::Secondary;
+    bool enabled = !g_demo;
+    switch (UpdateNow()) {
+        case UpState::Checking: label = Tr(L"Checking…", L"Проверка…"); enabled = false; break;
+        case UpState::UpToDate: label = Tr(L"Up to date", L"Последняя"); break;
+        case UpState::Available: {
+            std::lock_guard<std::mutex> lock(g_upLock);
+            label = std::wstring(Tr(L"Update ", L"Обновить ")) + g_up.release.tag;
+            kind = BtnKind::Primary;
+            break;
+        }
+        case UpState::Downloading: label = Tr(L"Downloading…", L"Загрузка…"); enabled = false; break;
+        case UpState::Failed: label = Tr(L"Retry check", L"Повторить"); break;
+        case UpState::Idle: break;
+    }
+    Text(g, std::wstring(L"v") + aero::kAppVersion, *g_fMonoSmall, RectF(px, panel.Y + S(124), S(70), S(34)), th::faint, intro);
+    Button(g, RectF(panel.X + pw - S(16) - S(138), panel.Y + S(124), S(138), S(34)), label, kind, enabled, Act::Update, 0, intro);
 }
 
-void DrawHeader(Gdiplus::Graphics& g, const Lay& L) {
-    const RectF& h = L.header;
+void DrawHero(Gdiplus::Graphics& g, const RectF& h, float a) {
     const int sel = SelectedProfile();
+    Card(g, h, a);
     if (sel < 0) {
-        DrawStr(g, Tr(L"No game profiles", L"Нет профилей игр"), *g_fTitle, RectF(h.X, h.Y, h.Width, S(36)), kText);
-        DrawStr(g, Tr(L"Add a profile .ini to the profiles folder next to the hub.", L"Добавьте профиль .ini в папку profiles рядом с хабом."), *g_fBody, RectF(h.X, h.Y + S(40), h.Width, S(24)), kDim);
+        Text(g, Tr(L"No game profiles", L"Нет профилей игр"), *g_fHero, RectF(h.X + S(28), h.Y + S(26), h.Width, S(44)), th::text, a);
+        Text(g, Tr(L"Add a profile .ini to the profiles folder next to the hub.", L"Добавьте профиль .ini в папку profiles рядом с хабом."),
+             *g_fBody, RectF(h.X + S(28), h.Y + S(78), h.Width, S(24)), th::dim, a);
         return;
     }
-    const Status& st = g_status[sel];
-    DrawStr(g, g_profiles[sel].name, *g_fTitle, RectF(h.X, h.Y, h.Width * 0.5f, S(36)), kText);
-
-    // Actions on the right. Minecraft has two (auto-detect, install mod); every other game has its primary action and Refresh.
-    const PrimaryState prim = GetPrimary();
-    const float bh = S(40);
-    float leftmost;
-    if (g_profiles[sel].kind == aero::GameKind::FabricMod) {
-        const RectF install(h.X + h.Width - S(150), h.Y + S(2), S(150), bh);
-        const RectF detect(install.X - S(12) - S(210), h.Y + S(2), S(210), bh);
-        DrawButton(g, detect, prim.label, true, prim.enabled, IsHover(Act::Primary, 0), IsPressed(Act::Primary, 0));
-        DrawButton(g, install, Tr(L"Install mod", L"Установить мод"), false, true, IsHover(Act::Secondary, 0), IsPressed(Act::Secondary, 0));
-        AddHit(Act::Primary, 0, detect, prim.enabled);
-        AddHit(Act::Secondary, 0, install);
-        leftmost = detect.X;
-    } else {
-        const RectF refresh(h.X + h.Width - S(96), h.Y + S(2), S(96), bh);
-        const RectF primary(refresh.X - S(12) - S(176), h.Y + S(2), S(176), bh);
-        DrawButton(g, primary, prim.label, true, prim.enabled, IsHover(Act::Primary, 0), IsPressed(Act::Primary, 0));
-        DrawButton(g, refresh, Tr(L"Refresh", L"Обновить"), false, true, IsHover(Act::Refresh, 0), IsPressed(Act::Refresh, 0));
-        AddHit(Act::Primary, 0, primary, prim.enabled);
-        AddHit(Act::Refresh, 0, refresh);
-        leftmost = primary.X;
-        if (IsForts(g_profiles[sel])) {
-            const RectF logs(primary.X - S(12) - S(150), h.Y + S(2), S(150), bh);
-            DrawButton(g, logs, Tr(L"Collect logs", L"Собрать логи"), false, true, IsHover(Act::CollectLogs, 0), IsPressed(Act::CollectLogs, 0));
-            AddHit(Act::CollectLogs, 0, logs);
-            leftmost = logs.X;
+    const aero::GameProfile& p = g_profiles[sel];
+    COLORREF c1, c2;
+    GameHue(p, c1, c2);
+    // Banner: game colors fading out to the right, a large faint initial, a thin light line on top.
+    {
+        Gdiplus::GraphicsPath clip;
+        RoundPath(clip, h, S(16));
+        g.SetClip(&clip);
+        if (Gdiplus::Bitmap* art = GameArt(p)) {
+            // Slow drift of the picture while the page settles.
+            const float drift = 1.0f - EaseOutCubic(Progress(g_pageStart, 1.6));
+            const RectF zoom(h.X - S(30) * drift, h.Y - S(10) * drift, h.Width + S(60) * drift, h.Height + S(20) * drift);
+            DrawCover(g, art, drift > 0.001f ? zoom : h, 0, a, 0.55f);
+            Gdiplus::LinearGradientBrush shade(h, Col(th::bg, 0), Col(th::bg, 0), 0.0f, TRUE);
+            Gdiplus::REAL pos[3] = {0.0f, 0.55f, 1.0f};
+            Gdiplus::Color cols[3] = {Col(th::bg, A(0.94f * a)), Col(th::bg, A(0.55f * a)), Col(th::bg, A(0.12f * a))};
+            shade.SetInterpolationColors(cols, pos, 3);
+            g.FillRectangle(&shade, h);
+            const RectF lower(h.X, h.Y + h.Height * 0.5f, h.Width, h.Height * 0.5f);
+            Gdiplus::LinearGradientBrush bottom(Inflate(lower, 1), Col(th::bg, 0), Col(th::bg, A(0.55f * a)), 90.0f, TRUE);
+            g.FillRectangle(&bottom, lower);
+        } else {
+            Gdiplus::Font big(L"Segoe UI Semibold", S(190), Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+            Text(g, p.name.substr(0, 1), big, RectF(h.X + h.Width - S(260), h.Y - S(44), S(240), S(250)), RGB(255, 255, 255), 0.05f * a,
+                 Gdiplus::StringAlignmentFar);
         }
+        g.ResetClip();
     }
+    const Status& st = g_status[sel];
+    Text(g, p.name, *g_fHero, RectF(h.X + S(28), h.Y + S(22), h.Width * 0.55f, S(46)), th::text, a);
+    const float cw = Chip(g, h.X + S(28), h.Y + S(76), StatusWord(static_cast<std::size_t>(sel)), st.level, a);
+    Text(g, st.text, *g_fSmall, RectF(h.X + S(28) + cw + S(12), h.Y + S(76), h.Width * 0.62f - cw - S(40), S(28)), th::dim, a);
+    if (!p.note.empty()) Text(g, p.note, *g_fSmall, RectF(h.X + S(28), h.Y + S(112), h.Width * 0.55f, S(22)), th::faint, a);
 
-    // Status pill and details under the title.
-    const float py = h.Y + S(44);
-    const float pw = DrawPill(g, h.X, py, StatusWord(static_cast<std::size_t>(sel)), LevelColor(st.level));
-    DrawStr(g, st.text, *g_fSmall, RectF(h.X + pw + S(14), py, max(S(100), leftmost - (h.X + pw + S(14)) - S(12)), S(26)), kDim);
+    // Actions on the right, stacked from the right edge.
+    const PrimaryState prim = GetPrimary();
+    const float bh = S(42), by = h.Y + (h.Height - bh) / 2;
+    float right = h.X + h.Width - S(24);
+    auto place = [&](float w) {
+        right -= w;
+        const RectF r(right, by, w, bh);
+        right -= S(10);
+        return r;
+    };
+    if (p.kind == aero::GameKind::SlimeRancher) {
+        const bool canLaunch = g_sr.found && !g_sr.install.appId.empty();
+        Button(g, place(S(160)), Tr(L"Launch game", L"Запустить игру"), BtnKind::Secondary, canLaunch, Act::Secondary, 0, a);
+        Button(g, place(S(150)), prim.label, BtnKind::Primary, prim.enabled, Act::Primary, 0, a);
+    } else if (p.kind == aero::GameKind::FabricMod) {
+        Button(g, place(S(190)), Tr(L"Download mod", L"Скачать мод"), BtnKind::Primary, true, Act::Secondary, 0, a);
+    } else {
+        Button(g, place(S(104)), Tr(L"Refresh", L"Обновить"), BtnKind::Ghost, true, Act::Refresh, 0, a);
+        Button(g, place(S(184)), prim.label, BtnKind::Primary, prim.enabled, Act::Primary, 0, a);
+        if (IsForts(p)) Button(g, place(S(150)), Tr(L"Collect logs", L"Собрать логи"), BtnKind::Secondary, true, Act::CollectLogs, 0, a);
+    }
 }
 
-void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
-    const RectF& c = L.guide;
-    DrawCard(g, c);
-    DrawStr(g, Tr(L"In-game menu", L"Меню в игре"), *g_fH2, RectF(c.X + S(20), c.Y + S(14), c.Width - S(40), S(24)), kText);
+void DrawGuide(Gdiplus::Graphics& g, const RectF& c, float a) {
+    Card(g, c, a);
     const int sel = SelectedProfile();
+    const bool slime = sel >= 0 && g_profiles[sel].kind == aero::GameKind::SlimeRancher;
+    COLORREF c1 = th::blue, c2 = th::violet;
+    if (sel >= 0) GameHue(g_profiles[sel], c1, c2);
+    CardTitle(g, c, slime ? Tr(L"Game part", L"Часть игры") : Tr(L"How to use", L"Как пользоваться"), c1, a);
     const bool active = sel >= 0 && g_status[sel].level == Level::Active;
     const bool minecraft = sel >= 0 && g_profiles[sel].kind == aero::GameKind::FabricMod;
     const std::wstring lead = minecraft ? (active ? Tr(L"AeroClient is loaded. Everything is switched in the game itself.", L"AeroClient загружен. Всё переключается в игре.")
-                                          : g_mc.found ? Tr(L"Install the mod, drop it into the mods folder and start the game.", L"Установите мод, положите в папку mods и запустите игру.")
-                                                       : Tr(L"Press Auto-detect Minecraft. If it finds nothing, start the game.", L"Нажмите «Найти Minecraft», иначе запустите игру."))
+                                          : g_mc.found ? Tr(L"Download the mod, drop it into the mods folder and start the game.", L"Скачайте мод, положите в папку mods и запустите игру.")
+                                                       : Tr(L"Download the mod and drop it into the mods folder of Fabric 1.21.1.", L"Скачайте мод и положите его в папку mods у Fabric 1.21.1."))
                               : active   ? Tr(L"Cheats are switched in the game itself. Open its menu during a match.", L"Функции включаются в самой игре: откройте её меню.")
                                          : Tr(L"Launch the game and load the module; cheats are then switched in the game's own menu.", L"Запустите игру и модуль, функции включаются в игре.");
-    // The module hooks OpenGL's SwapBuffers, so a Forts set to Vulkan never shows the menu: say so and offer the fix.
-    float shift = 0;
+    float y = c.Y + S(58);
+    const float x = c.X + S(24), w = c.Width - S(48);
+    // Forts on Vulkan never shows the menu (the module hooks OpenGL): say so and offer the fix.
     if (sel >= 0 && IsForts(g_profiles[sel]) &&
         (g_gfx.state == aero::diag::GraphicsState::Vulkan || g_gfx.state == aero::diag::GraphicsState::NotSet)) {
-        shift = S(58);
-        const RectF strip(c.X + S(20), c.Y + S(46), c.Width - S(40), S(48));
-        FillRR(g, strip, S(8), kWarn, 34);
-        StrokeRR(g, strip, S(8), kWarn, 1.0f, 150);
-        const RectF btn(strip.X + strip.Width - S(160) - S(6), strip.Y + S(6), S(160), strip.Height - S(12));
+        const RectF strip(x, y, w, S(50));
+        Fill(g, strip, S(12), th::warn, 0.12f * a);
+        Stroke(g, strip, S(12), th::warn, 0.45f * a);
+        const RectF btn(strip.X + strip.Width - S(156) - S(7), strip.Y + S(7), S(156), strip.Height - S(14));
         const bool vulkan = g_gfx.state == aero::diag::GraphicsState::Vulkan;
-        DrawStr(g, vulkan ? Tr(L"Forts is on Vulkan: needs OpenGL", L"Forts на Vulkan: нужен OpenGL") : Tr(L"Graphics API not set: needs OpenGL", L"Графический API не задан: нужен OpenGL"), *g_fSmall,
-                RectF(strip.X + S(14), strip.Y, strip.Width - btn.Width - S(30), strip.Height), kText);
-        DrawButton(g, btn, Tr(L"Switch to OpenGL", L"На OpenGL"), true, true, IsHover(Act::SwitchOpenGl, 0), IsPressed(Act::SwitchOpenGl, 0));
-        AddHit(Act::SwitchOpenGl, 0, btn);
+        Text(g, vulkan ? Tr(L"Forts is on Vulkan: needs OpenGL", L"Forts на Vulkan: нужен OpenGL") : Tr(L"Graphics API not set: needs OpenGL", L"Графический API не задан: нужен OpenGL"),
+             *g_fSmallBold, RectF(strip.X + S(14), strip.Y, strip.Width - btn.Width - S(30), strip.Height), th::warn, a);
+        Button(g, btn, Tr(L"Switch to OpenGL", L"На OpenGL"), BtnKind::Primary, true, Act::SwitchOpenGl, 0, a);
+        y += S(62);
     }
-    DrawStr(g, lead, *g_fBody, RectF(c.X + S(20), c.Y + S(50) + shift, c.Width - S(40), S(24)), kText);
-
+    if (slime) {
+        Segmented(g, RectF(x, y, std::min(w, S(400)), S(40)), {aero::sr::Title(1), aero::sr::Title(2)}, g_sr.part - 1, Act::SrPart, 1, Key(12), a);
+        y += S(54);
+    } else {
+        Text(g, lead, *g_fBody, RectF(x, y, w, S(44)), th::text, a, Gdiplus::StringAlignmentNear, Gdiplus::StringAlignmentNear, true);
+        y += S(50);
+    }
     if (sel < 0) return;
-    // One line per "|"-separated hint. The Minecraft tab starts with what it knows about the game and the mod file.
     std::wstring hk = g_profiles[sel].hotkeys;
     if (g_lang == 1) {
         static const std::pair<const wchar_t*, const wchar_t*> kHints[] = {
@@ -1119,10 +1610,15 @@ void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
             {L"Right Shift or Insert = open the module menu", L"Right Shift или Insert = открыть меню модуля"},
             {L".mine diamond_ore = auto-mine an ore", L".mine diamond_ore = автодобыча руды"},
             {L".help = chat commands", L".help = команды чата"}};
-        for (const auto& h : kHints) {
-            const std::size_t at = hk.find(h.first);
-            if (at != std::wstring::npos) hk.replace(at, wcslen(h.first), h.second);
+        for (const auto& hint : kHints) {
+            const std::size_t at = hk.find(hint.first);
+            if (at != std::wstring::npos) hk.replace(at, wcslen(hint.first), hint.second);
         }
+    }
+    if (slime) {
+        hk = std::wstring(Tr(L"Game: ", L"Игра: ")) + aero::sr::Title(g_sr.part) +
+             (g_sr.found ? Tr(L"  |  Folder: ", L"  |  Папка: ") + g_sr.install.dir.wstring() : std::wstring(Tr(L"  |  Not found in the Steam libraries", L"  |  Не найдена в библиотеках Steam"))) +
+             Tr(L"  |  Cheats: not built yet (they need the game to be measured)", L"  |  Читы: пока нет (их делают на самой игре)");
     }
     if (minecraft) {
         std::wstring info = g_mc.found ? std::wstring(Tr(L"Game: ", L"Игра: ")) + GameLabel(g_mc.game) + Tr(L"  |  Folder: ", L"  |  Папка: ") + g_mc.game.dir.wstring() +
@@ -1130,14 +1626,12 @@ void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
                                              (aero::mc::HasMod(g_mc.game.dir) ? Tr(L"in the mods folder", L"в папке mods") : Tr(L"not in the mods folder yet", L"ещё не в папке mods"))
                                        : std::wstring(Tr(L"Game: not detected yet", L"Игра: ещё не найдена"));
         info += std::wstring(Tr(L"  |  Mod file: ", L"  |  Файл мода: ")) +
-                (g_mc.savedJar.empty() ? std::wstring(Tr(L"press Install mod to put it in Downloads", L"нажмите «Установить мод», файл попадёт в Загрузки")) : g_mc.savedJar.wstring());
+                (g_mc.savedJar.empty() ? std::wstring(Tr(L"press Download mod, it goes to Downloads", L"нажмите «Скачать мод», файл попадёт в Загрузки")) : g_mc.savedJar.wstring());
         hk = info + (hk.empty() ? L"" : L"  |  " + hk);
     }
-    if (hk.empty()) return;
-    float y = c.Y + S(92) + shift;
-    const float lh = S(34);
-    Gdiplus::Pen sep(Col(kBorder), 1.0f);
-    for (std::size_t start = 0; start <= hk.size();) {
+    const float lh = S(38);
+    int n = 0;
+    for (std::size_t start = 0; start <= hk.size() && !hk.empty();) {
         std::size_t end = hk.find(L'|', start);
         if (end == std::wstring::npos) end = hk.size();
         std::wstring part = hk.substr(start, end - start);
@@ -1146,75 +1640,140 @@ void DrawGuide(Gdiplus::Graphics& g, const Lay& L) {
         const auto e = part.find_last_not_of(L' ');
         if (b == std::wstring::npos) continue;
         part = part.substr(b, e - b + 1);
-        if (y + lh > c.Y + c.Height - S(10)) break;
-        FillDot(g, c.X + S(26), y + lh / 2, S(3), kAccentRing);
-        DrawStr(g, part, *g_fSmall, RectF(c.X + S(40), y, c.Width - S(60), lh), kDim);
-        g.DrawLine(&sep, c.X + S(20), y + lh - 0.5f, c.X + c.Width - S(20), y + lh - 0.5f);
+        if (y + lh > c.Y + c.Height - S(12)) break;
+        const float rowA = a * EaseOutCubic(Progress(g_pageStart + 0.08 + 0.05 * n, 0.35));
+        HintRow(g, RectF(x + S(10) * (1 - rowA / std::max(a, 0.01f)), y, w, lh), part, rowA);
         y += lh;
+        ++n;
     }
 }
-void DrawLive(Gdiplus::Graphics& g, const Lay& L) {
-    const RectF& c = L.live;
-    DrawCard(g, c);
-    DrawStr(g, Tr(L"Live info", L"Данные игры"), *g_fH2, RectF(c.X + S(20), c.Y + S(14), c.Width - S(160), S(24)), kText);
-    // Link pill on the right.
+
+void DrawLive(Gdiplus::Graphics& g, const RectF& c, float a) {
+    Card(g, c, a);
+    CardTitle(g, c, Tr(L"Live info", L"Данные игры"), th::cyan, a);
     {
-        const float w = S(26) + S(8) * 2 + MeasureW(g, g_link.text, *g_fSmall) + S(8);
-        DrawPill(g, c.X + c.Width - S(20) - w, c.Y + S(13), g_link.text, LevelColor(g_link.level));
+        const float w = S(30) + MeasureW(g, g_link.text, *g_fSmallBold) + S(28);
+        Chip(g, c.X + c.Width - S(20) - w, c.Y + S(17), g_link.text, g_link.level, a);
     }
     if (g_infoRows.empty()) {
-        DrawEmptyState(g, RectF(c.X, c.Y + S(40), c.Width, c.Height - S(40)), Tr(L"No live data", L"Нет данных"), Tr(L"Values appear while the module is active in a match.", L"Значения появятся, пока модуль активен в матче."));
+        const float cx = c.X + c.Width / 2, cy = c.Y + c.Height / 2 + S(4);
+        const float spin = 300.0f;
+        Gdiplus::Pen ring(Col(th::line, A(a)), S(3));
+        g.DrawEllipse(&ring, cx - S(20), cy - S(42), S(40), S(40));
+        Gdiplus::Pen arc(Col(th::cyan, A(0.8f * a)), S(3));
+        arc.SetStartCap(Gdiplus::LineCapRound);
+        arc.SetEndCap(Gdiplus::LineCapRound);
+        g.DrawArc(&arc, cx - S(20), cy - S(42), S(40), S(40), spin, 70.0f);
+        Text(g, Tr(L"Waiting for the game", L"Ждём игру"), *g_fBodyBold, RectF(c.X, cy + S(8), c.Width, S(24)), th::text, a, Gdiplus::StringAlignmentCenter);
+        Text(g, Tr(L"Values appear while the module is active in a match.", L"Данные появятся, когда модуль активен в матче."), *g_fSmall,
+             RectF(c.X + S(16), cy + S(32), c.Width - S(32), S(22)), th::dim, a, Gdiplus::StringAlignmentCenter);
         return;
     }
-    float y = c.Y + S(52);
-    const float rowH = S(36);
-    Gdiplus::Pen sep(Col(kBorder), 1.0f);
+    float y = c.Y + S(60);
+    const float rowH = S(38);
+    int i = 0;
     for (const InfoRow& r : g_infoRows) {
-        if (y + rowH > c.Y + c.Height - S(8)) break;
-        DrawStr(g, r.key, *g_fSmall, RectF(c.X + S(20), y, c.Width * 0.55f, rowH), kDim);
-        DrawStr(g, r.value, *g_fMono, RectF(c.X + c.Width * 0.5f, y, c.Width * 0.5f - S(20), rowH), kText, Gdiplus::StringAlignmentFar);
-        g.DrawLine(&sep, c.X + S(20), y + rowH - 0.5f, c.X + c.Width - S(20), y + rowH - 0.5f);
+        if (y + rowH > c.Y + c.Height - S(10)) break;
+        const RectF row(c.X + S(14), y, c.Width - S(28), rowH - S(4));
+        if (i % 2 == 0) Fill(g, row, S(9), th::card2, 0.45f * a);
+        Text(g, r.key, *g_fSmall, RectF(row.X + S(12), y, row.Width * 0.55f, rowH - S(4)), th::dim, a);
+        Text(g, r.value, *g_fMono, RectF(row.X + row.Width * 0.45f, y, row.Width * 0.55f - S(12), rowH - S(4)), th::text, a,
+             Gdiplus::StringAlignmentFar);
         y += rowH;
+        ++i;
     }
 }
 
 void DrawLog(Gdiplus::Graphics& g, const Lay& L) {
-    DrawCard(g, L.log);
-    const RectF& t = L.logTabs;
-    FillRR(g, t, S(8), kBg);
-    const float w1 = S(132), w2 = S(100);
-    const RectF tab1(t.X + S(3), t.Y + S(3), w1, t.Height - S(6)), tab2(tab1.X + w1 + S(4), t.Y + S(3), w2, t.Height - S(6));
-    auto drawTab = [&](const RectF& r, const wchar_t* text, bool active, Act act) {
-        if (active) FillRR(g, r, S(6), kSurface2);
-        else if (IsHover(act, 0)) FillRR(g, r, S(6), kSurface2, 110);
-        DrawStr(g, text, *g_fSmall, r, active ? kText : kDim, Gdiplus::StringAlignmentCenter);
-        AddHit(act, 0, r);
-    };
-    drawTab(tab1, Tr(L"Module log", L"Лог модуля"), g_tab == 0, Act::TabModule);
-    drawTab(tab2, Tr(L"Hub log", L"Лог хаба"), g_tab == 1, Act::TabHub);
-    DrawStr(g, Tr(L"live", L"онлайн"), *g_fSmall, RectF(L.log.X + L.log.Width - S(70), L.log.Y + S(12), S(54), S(32)), kDim, Gdiplus::StringAlignmentFar);
-    Gdiplus::Pen sep(Col(kBorder), 1.0f);
-    g.DrawLine(&sep, L.log.X + S(1), L.log.Y + S(55), L.log.X + L.log.Width - S(1), L.log.Y + S(55));
+    Card(g, L.log);
+    const RectF& c = L.log;
+    CardTitle(g, c, Tr(L"Journal", L"Журнал"), th::violet, 1.0f);
+    Segmented(g, RectF(c.X + S(140), c.Y + S(13), S(230), S(34)), {Tr(L"Module", L"Модуль"), Tr(L"Hub", L"Хаб")}, g_tab, Act::TabModule, 0, Key(13));
+    // Collapse / expand chevron.
+    const RectF chev(c.X + c.Width - S(54), c.Y + S(12), S(38), S(36));
+    AddHit(Act::LogToggle, 0, chev);
+    const float h = HoverT(Act::LogToggle, 0);
+    Fill(g, chev, S(10), th::card2, 0.4f + 0.6f * h);
+    const float ang = 180.0f * g_logOpenT;
+    Gdiplus::Pen pen(Col(Mix(th::dim, th::text, h)), S(2));
+    pen.SetStartCap(Gdiplus::LineCapRound);
+    pen.SetEndCap(Gdiplus::LineCapRound);
+    Gdiplus::GraphicsState s = g.Save();
+    g.TranslateTransform(chev.X + chev.Width / 2, chev.Y + chev.Height / 2);
+    g.RotateTransform(ang);
+    const Gdiplus::PointF pts[3] = {{-S(6), -S(3)}, {0, S(3)}, {S(6), -S(3)}};
+    g.DrawLines(&pen, pts, 3);
+    g.Restore(s);
+    if (L.logBody.Height > S(8)) {
+        Fill(g, L.logBody, S(12), th::logBg, std::clamp(L.logBody.Height / S(40), 0.0f, 1.0f));
+        Stroke(g, L.logBody, S(12), th::line, std::clamp(L.logBody.Height / S(40), 0.0f, 1.0f));
+    }
 }
 
 void Render(Gdiplus::Graphics& g, int w, int h) {
+    g_now = NowSec();
+    if (g_appStart == 0) g_appStart = g_now;
+    const double gap = g_now - g_lastFrame;
+    g_dt = gap > 0.1 ? 1.0f / 60.0f : static_cast<float>(gap);
+    g_lastFrame = g_now;
+    g_animating = false;
+    g_pulsing = false;
+
     g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
     g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
-    g.Clear(Col(kBg));
+    g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
     g_hits.clear();
-    const Lay L = Compute(w, h);
+
+    const float openT = EaseOutCubic(Ease(Key(14), g_logOpen ? 1.0f : 0.0f, 9.0f));
+    if (std::fabs(openT - g_logOpenT) > 0.0005f) {
+        g_logOpenT = openT;
+        PositionLogs();
+    }
+    const Lay L = Compute(w, h, g_logOpenT);
     DrawSidebar(g, L);
-    DrawHeader(g, L);
-    DrawGuide(g, L);
-    DrawLive(g, L);
+
+    // Page transition when another game is chosen: content slides up and fades in, cards one after another.
+    const float intro = EaseOutCubic(Progress(g_appStart + 0.1, 0.5));
+    auto page = [&](double delay) { return std::min(intro, EaseOutCubic(Progress(g_pageStart + delay, 0.38))); };
+    const float a1 = page(0.0), a2 = page(0.06), a3 = page(0.12);
+    auto lift = [&](RectF r, float t) { r.Y += S(18) * (1 - t); return r; };
+    DrawHero(g, lift(L.hero, a1), a1);
+    DrawGuide(g, lift(L.guide, a2), a2);
+    DrawLive(g, lift(L.live, a3), a3);
     DrawLog(g, L);
+    DrawCaptionButtons(g, static_cast<float>(w));
 }
 
 void Paint(HDC dc, int w, int h) {
     if (w <= 0 || h <= 0) return;
     HDC mem = CreateCompatibleDC(dc);
-    HBITMAP bm = CreateCompatibleBitmap(dc, w, h);
+    // A 32-bit DIB back buffer: GDI+ draws on it far faster than on a device-dependent bitmap.
+    BITMAPINFO bi{};
+    bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
     HGDIOBJ old = SelectObject(mem, bm);
+    {  // the static background is a plain GDI blit (a full-window GDI+ DrawImage costs ~30 ms)
+        static HBITMAP bgHbm = nullptr;
+        static const Gdiplus::Bitmap* bgFor = nullptr;
+        Gdiplus::Bitmap* bgBmp = Background(w, h);
+        if (bgFor != bgBmp || !bgHbm) {
+            if (bgHbm) DeleteObject(bgHbm);
+            bgHbm = nullptr;
+            bgBmp->GetHBITMAP(Gdiplus::Color(255, 0, 0, 0), &bgHbm);
+            bgFor = bgBmp;
+        }
+        HDC src = CreateCompatibleDC(dc);
+        HGDIOBJ o2 = SelectObject(src, bgHbm);
+        BitBlt(mem, 0, 0, w, h, src, 0, 0, SRCCOPY);
+        SelectObject(src, o2);
+        DeleteDC(src);
+    }
     {
         Gdiplus::Graphics g(mem);
         Render(g, w, h);
@@ -1223,6 +1782,13 @@ void Paint(HDC dc, int w, int h) {
     SelectObject(mem, old);
     DeleteObject(bm);
     DeleteDC(mem);
+    // Keep frames coming while something moves (60 fps), slower for the idle pulse, none when still.
+    const UINT want = g_animating ? 15 : (g_pulsing ? 50 : 0);
+    if (want != g_animInterval) {
+        if (want) SetTimer(g_hwnd, kAnimTimer, want, nullptr);
+        else KillTimer(g_hwnd, kAnimTimer);
+        g_animInterval = want;
+    }
 }
 
 // ---------------------------------------------------------------- input
@@ -1252,21 +1818,37 @@ void Perform(Act act, int idx) {
         case Act::SelectGame:
             if (idx != g_sel) {
                 g_sel = idx;
+                g_pageStart = NowSec();
                 UpdateChannel();
                 PollModuleLog();
+            }
+            break;
+        case Act::SrPart:
+            if ((idx == 1 || idx == 2) && idx != g_sr.part) {
+                g_sr.part = idx;
+                WritePrivateProfileStringW(L"SlimeRancher", L"Part", idx == 2 ? L"2" : L"1", g_settingsFile.c_str());
+                DetectSlimeRancher();
+                Refresh();
             }
             break;
         case Act::Primary: DoPrimary(); break;
         case Act::Secondary: DoSecondary(); break;
         case Act::Refresh: Refresh(); break;
         case Act::AutoSwitch: g_autoInject = !g_autoInject; SaveSettings(); break;
-        case Act::TabModule: g_tab = 0; PositionLogs(); break;
+        case Act::TabModule: g_tab = idx == 1 ? 1 : 0; PositionLogs(); break;
         case Act::TabHub: g_tab = 1; PositionLogs(); break;
         case Act::CollectLogs: DoCollectLogs(); break;
         case Act::SwitchOpenGl: DoSwitchOpenGl(); break;
         case Act::Update: DoUpdate(); break;
-        case Act::LangEn:
-        case Act::LangRu: SetLanguage(act == Act::LangRu ? 1 : 0); break;
+        case Act::LangEn: SetLanguage(idx == 1 ? 1 : 0); break;
+        case Act::LangRu: SetLanguage(1); break;
+        case Act::WinMin: ShowWindow(g_hwnd, SW_MINIMIZE); break;
+        case Act::WinMax: ShowWindow(g_hwnd, IsZoomed(g_hwnd) ? SW_RESTORE : SW_MAXIMIZE); break;
+        case Act::WinClose: PostMessageW(g_hwnd, WM_CLOSE, 0, 0); break;
+        case Act::LogToggle:
+            g_logOpen = !g_logOpen;
+            WritePrivateProfileStringW(L"Hub", L"LogOpen", g_logOpen ? L"1" : L"0", g_settingsFile.c_str());
+            break;
         case Act::None: break;
     }
     Redraw();
@@ -1287,8 +1869,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
             g_hwnd = hwnd;
+            {  // explicit big and small icons, so the taskbar takes them from the window and not from a cached copy
+                const HINSTANCE inst = GetModuleHandleW(nullptr);
+                const auto big = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON), 0));
+                const auto smallIcon = static_cast<HICON>(LoadImageW(inst, MAKEINTRESOURCEW(1), IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0));
+                if (big) SendMessageW(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(big));
+                if (smallIcon) SendMessageW(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(smallIcon));
+            }
             const BOOL dark = TRUE;
             DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+            {  // Windows 11: title bar and border in the app's own colors
+                const COLORREF caption = th::side, captionText = th::text, border = th::line;
+                DwmSetWindowAttribute(hwnd, 35 /*DWMWA_CAPTION_COLOR*/, &caption, sizeof(caption));
+                DwmSetWindowAttribute(hwnd, 36 /*DWMWA_TEXT_COLOR*/, &captionText, sizeof(captionText));
+                DwmSetWindowAttribute(hwnd, 34 /*DWMWA_BORDER_COLOR*/, &border, sizeof(border));
+            }
             g_dpi = static_cast<int>(GetDpiForWindow(hwnd));
             const DWORD style = WS_CHILD | WS_VSCROLL | ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL;
             g_editModule = CreateWindowExW(0, L"EDIT", L"", style | WS_VISIBLE, 0, 0, 0, 0, hwnd, reinterpret_cast<HMENU>(kEditModule), nullptr, nullptr);
@@ -1300,6 +1895,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             MakeFonts();
 
             g_autoInject = GetPrivateProfileIntW(L"Hub", L"AutoInject", 0, g_settingsFile.c_str()) != 0;
+            g_logOpen = GetPrivateProfileIntW(L"Hub", L"LogOpen", 1, g_settingsFile.c_str()) != 0;
+            g_logOpenT = g_logOpen ? 1.0f : 0.0f;
+            g_springs[Key(14)] = g_logOpenT;
             {
                 wchar_t lang[16]{};
                 GetPrivateProfileStringW(L"Hub", L"Language", L"", lang, static_cast<DWORD>(std::size(lang)), g_settingsFile.c_str());
@@ -1321,6 +1919,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (const auto& e : errors) Log(L"profile skipped: " + e);
             LoadMinecraftSettings();
             if (!g_mc.found) AutoDetect();
+            g_sr.part = GetPrivateProfileIntW(L"SlimeRancher", L"Part", 1, g_settingsFile.c_str()) == 2 ? 2 : 1;
+            DetectSlimeRancher();
             Refresh();
             PositionLogs();
             g_checkUpdates = GetPrivateProfileIntW(L"Hub", L"CheckUpdates", 1, g_settingsFile.c_str()) != 0;
@@ -1329,7 +1929,47 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(hwnd, kTimer, 1000, nullptr);
             return 0;
         }
+        case WM_NCCALCSIZE:
+            if (wp) {  // no system title bar: the client area takes the whole window (the frame keeps resize and snap)
+                auto* p = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
+                if (IsZoomed(hwnd)) {
+                    const UINT dpi = GetDpiForWindow(hwnd);
+                    const int f = GetSystemMetricsForDpi(SM_CXFRAME, dpi) + GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                    p->rgrc[0].left += f;
+                    p->rgrc[0].top += f;
+                    p->rgrc[0].right -= f;
+                    p->rgrc[0].bottom -= f;
+                }
+                return 0;
+            }
+            break;
+        case WM_NCHITTEST: {
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            const int b = static_cast<int>(S(6));
+            if (!IsZoomed(hwnd)) {
+                const bool l = pt.x < b, r = pt.x >= rc.right - b, t = pt.y < b, d = pt.y >= rc.bottom - b;
+                if (t && l) return HTTOPLEFT;
+                if (t && r) return HTTOPRIGHT;
+                if (d && l) return HTBOTTOMLEFT;
+                if (d && r) return HTBOTTOMRIGHT;
+                if (l) return HTLEFT;
+                if (r) return HTRIGHT;
+                if (t) return HTTOP;
+                if (d) return HTBOTTOM;
+            }
+            if (pt.y < S(40)) {
+                Act a = Act::None;
+                int idx = -1;
+                bool en = false;
+                if (!HitAt(pt.x, pt.y, a, idx, en)) return HTCAPTION;  // drag the window by its top strip
+            }
+            return HTCLIENT;
+        }
         case WM_SIZE: PositionLogs(); Redraw(); return 0;
+        case WM_KILLFOCUS: g_hoverAct = Act::None; g_hoverIdx = -1; Redraw(); break;
         case WM_DPICHANGED: {
             g_dpi = HIWORD(wp);
             const RECT* r = reinterpret_cast<const RECT*>(lp);
@@ -1345,7 +1985,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_TIMER:
+            if (wp == kAnimTimer) {
+                Redraw();
+                return 0;
+            }
             PollWaiting();
+            PollSlimeRancher();
             Refresh();
             AutoInject();
             PollModuleLog();
@@ -1364,8 +2009,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORSTATIC: {
             HDC dc = reinterpret_cast<HDC>(wp);
-            SetTextColor(dc, kText);
-            SetBkColor(dc, kSurface);
+            SetTextColor(dc, RGB(196, 198, 204));
+            SetBkColor(dc, th::logBg);
             return reinterpret_cast<LRESULT>(g_surfaceBrush);
         }
         case WM_MOUSEMOVE: {
@@ -1432,7 +2077,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
 
     Gdiplus::GdiplusStartupInput gin;
     Gdiplus::GdiplusStartup(&g_gdiToken, &gin, nullptr);
-    g_surfaceBrush = CreateSolidBrush(kSurface);
+    g_surfaceBrush = CreateSolidBrush(th::logBg);
     g_dpi = static_cast<int>(GetDpiForSystem());
 
     WNDCLASSW wc{};
@@ -1444,9 +2089,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
     wc.lpszClassName = L"AeroHubWnd";
     RegisterClassW(&wc);
 
-    HWND hwnd = CreateWindowW(wc.lpszClassName, L"AeroHub", WS_OVERLAPPEDWINDOW | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
+    HWND hwnd = CreateWindowW(wc.lpszClassName, L"AeroHub", WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN | WS_VISIBLE, CW_USEDEFAULT, CW_USEDEFAULT,
                               static_cast<int>(S(1200)), static_cast<int>(S(780)), nullptr, nullptr, inst, nullptr);
     if (!hwnd) return 1;
+    SetWindowPos(hwnd, nullptr, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER);
     ShowWindow(hwnd, show);
 
     MSG m;
@@ -1454,6 +2100,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int show) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
+    g_bgCache.reset(); g_fSmallBold.reset(); g_fMonoSmall.reset(); g_fHero.reset(); g_fTile.reset();
     g_fTitle.reset(); g_fH2.reset(); g_fBody.reset(); g_fBodyBold.reset(); g_fSmall.reset(); g_fMono.reset(); g_fBrand.reset();
     Gdiplus::GdiplusShutdown(g_gdiToken);
     return static_cast<int>(m.wParam);

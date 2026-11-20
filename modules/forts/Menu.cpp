@@ -229,8 +229,11 @@ bool Menu::Render(const MenuView& v) {
     StrokeRR(g, card, 14 * s, kBorder);
 
     // Header: brand, title, status pill, close button. Dragging the header moves the window.
-    FillRR(g, RectF(18 * s, 18 * s, 40 * s, 40 * s), 11 * s, kAccent);
-    DrawStr(g, L"A", fBrand, RectF(18 * s, 18 * s, 40 * s, 40 * s), RGB(255, 255, 255), Gdiplus::StringAlignmentCenter);
+    // Brand mark as in the app icon: graphite tile, light "A", amber aim dot.
+    FillRR(g, RectF(18 * s, 18 * s, 40 * s, 40 * s), 11 * s, kSurface2);
+    StrokeRR(g, RectF(18 * s, 18 * s, 40 * s, 40 * s), 11 * s, kBorder);
+    DrawStr(g, L"A", fBrand, RectF(18 * s, 16 * s, 40 * s, 40 * s), kText, Gdiplus::StringAlignmentCenter);
+    FillDot(g, 38 * s, 44 * s, 3.5f * s, kAccent);
     DrawStr(g, L"AeroHub", fTitle, RectF(72 * s, 14 * s, 200 * s, 28 * s), kText);
     DrawStr(g, v.subtitle, fSmall, RectF(72 * s, 42 * s, 300 * s, 20 * s), kDim);
     if (!v.pill.empty()) {
