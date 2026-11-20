@@ -7,7 +7,8 @@ $dist = Join-Path $root 'dist'
 $stage = Join-Path $dist 'stage'
 
 # Program files only: no AeroHub.ini, FortsDrag.ini, logs or *.running-old.* (those are per-user).
-$files = @('AeroHub.exe', 'modules\FortsModule.dll', 'modules\FortsModule.ini', 'profiles\forts.ini', 'profiles\minecraft.ini')
+$files = @('AeroHub.exe', 'modules\FortsModule.dll', 'modules\FortsModule.ini', 'profiles\forts.ini', 'profiles\minecraft.ini',
+           'art\forts.jpg', 'art\forts_icon.jpg', 'art\minecraft.jpg', 'art\minecraft_icon.jpg')
 $jar = Join-Path $out 'modules\aeroclient.jar'
 if (Test-Path $jar) { $files += 'modules\aeroclient.jar' }
 foreach ($f in $files) { if (-not (Test-Path (Join-Path $out $f))) { throw "missing build output: $f (build Release first)" } }
