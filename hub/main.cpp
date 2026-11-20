@@ -1336,8 +1336,16 @@ Gdiplus::Bitmap* GameArt(const aero::GameProfile& p, bool icon = false) {
     if (icon) name += L"_icon";
     auto it = cache.find(name);
     if (it == cache.end()) {
-        auto bmp = std::make_unique<Gdiplus::Bitmap>((g_dir / L"art" / (name + L".jpg")).c_str());
-        if (bmp->GetLastStatus() != Gdiplus::Ok || bmp->GetWidth() == 0) bmp.reset();
+        // Copied into memory so the file is not kept open (a running hub must not block an update of the art).
+        std::unique_ptr<Gdiplus::Bitmap> bmp;
+        {
+            Gdiplus::Bitmap file((g_dir / L"art" / (name + L".jpg")).c_str());
+            if (file.GetLastStatus() == Gdiplus::Ok && file.GetWidth() > 0) {
+                bmp = std::make_unique<Gdiplus::Bitmap>(file.GetWidth(), file.GetHeight(), PixelFormat32bppPARGB);
+                Gdiplus::Graphics copy(bmp.get());
+                copy.DrawImage(&file, 0, 0, file.GetWidth(), file.GetHeight());
+            }
+        }
         it = cache.emplace(name, std::move(bmp)).first;
     }
     return it->second.get();

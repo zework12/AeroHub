@@ -52,6 +52,18 @@ function AeroCommand(team, feature, on)
 	-- Deliberately silent: this mod prints nothing, neither to the chat nor to the log.
 end
 
+-- Battery salvo: every listed gun fires at (x, y). Runs on every client in the same frame, so the match stays in step.
+-- Guns that are not ready are skipped by the game itself.
+function AeroSalvo(team, x, y, ...)
+	if type(team) ~= "number" or type(x) ~= "number" or type(y) ~= "number" then return end
+	local target = Vec3(x, y, 0)
+	for _, id in ipairs({ ... }) do
+		if type(id) == "number" and IsWeaponReadyToFire(id) then
+			FireWeapon(id, target, 0, FIREFLAG_NORMAL)
+		end
+	end
+end
+
 function AeroTheme(team)
 	if team ~= GetLocalTeamId() then return end
 	for _, panel in ipairs(ThemePanels) do

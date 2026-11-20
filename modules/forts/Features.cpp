@@ -717,7 +717,6 @@ void SetAutoAim(bool on) {
 }
 
 void SetBattery(bool on) {
-    if (RefusedOnline(on, "battery")) return;
     g_state.battery = on;
     if (!on) {
         g_state.group.clear();
@@ -804,9 +803,7 @@ void UpdateOnline(bool online) {
     Logf("network game: %d", online ? 1 : 0);
     if (!online) return;
     g_state.unlimited = g_state.fastBeams = g_state.fastDevices = g_state.fastReload = false;
-    g_state.commander = g_state.repair = g_state.autoAim = g_state.battery = false;
-    g_state.group.clear();
-    g_state.groupPointSet = false;
+    g_state.commander = g_state.repair = g_state.autoAim = false;
     g_state.framesSinceUnlimited = 0;
     g_state.buildApplied = g_state.buildSaved = false;
     g_state.reloadApplied = g_state.reloadSaved = false;
@@ -1571,11 +1568,9 @@ void UpdateGroup(int team, bool offline) {
 
 // FireWeapon (the game's own call, as the AI scripts use it) for every ready gun of the group, in one frame, at the same point.
 // Beam guns are skipped: they need EndFireWeapon after a hold time, which is not handled here.
+void GroupFireOnline(int team, const Vec3& target);
+
 void GroupFire() {
-    if (g_online) {
-        Logf("group fire refused: it would desync a network game");
-        return;
-    }
     int team = 0;
     if (!g_api.LocalTeam(team)) {
         Logf("group fire: no local team (not in a match)");
@@ -1589,6 +1584,10 @@ void GroupFire() {
     Vec3 target;
     if (!GroupTarget(target)) {
         Logf("group fire: no target (set a point under the cursor, or pick an enemy target)");
+        return;
+    }
+    if (g_online) {
+        GroupFireOnline(team, target);
         return;
     }
     int fired = 0, notReady = 0, beams = 0, faulted = 0;
@@ -1620,11 +1619,32 @@ void GroupFire() {
 
 // "Battery: target + fire": the point under the mouse becomes the target of the whole group, which fires a salvo at it. Turns the
 // battery on when it is off (the group then starts empty).
-void BatteryTarget() {
-    if (g_online) {
-        Logf("battery target refused: it would desync a network game");
+// Online the salvo must run on every client in the same frame, or the lockstep game splits: the module sends
+// AeroSalvo(team, x, y, gun ids...) through SendScriptEvent and the PC optimez lobby mod fires the guns there.
+void GroupFireOnline(int team, const Vec3& target) {
+    std::string params = std::to_string(team) + ", " + std::to_string(static_cast<int>(target.x)) + ", " + std::to_string(static_cast<int>(target.y));
+    int listed = 0, notReady = 0;
+    for (int id : g_state.group) {
+        bool ready = false;
+        if (g_api.WeaponReady(id, ready) && !ready) {
+            ++notReady;
+            continue;
+        }
+        params += ", " + std::to_string(id);
+        ++listed;
+    }
+    if (listed == 0) {
+        Logf("battery (online): no gun of the group is ready");
         return;
     }
+    if (!g_api.SendScriptEvent("AeroSalvo", params.c_str())) {
+        Logf("SendScriptEvent faulted (AeroSalvo %s)", params.c_str());
+        return;
+    }
+    Logf("battery (online): salvo sent to the mod: %d gun(s), %d not ready, target (%.0f, %.0f)", listed, notReady, target.x, target.y);
+}
+
+void BatteryTarget() {
     if (!g_state.battery) SetBattery(true);
     Vec3 screen{}, world{};
     if (!g_api.MouseWorld(screen, world)) {
@@ -2921,7 +2941,7 @@ void BuildRows(std::vector<MenuRow>& rows) {
         r.bindText = g_binds[i].vk ? KeyName(g_binds[i].vk) : std::wstring();
         r.bindHold = g_binds[i].hold;
         r.capturing = g_bindCapture == i;
-        if (g_online && (i == kItemFastBeams || i == kItemAutoAim || i == kItemBattery || i == kItemBatteryTarget)) {
+        if (g_online && (i == kItemFastBeams || i == kItemAutoAim)) {
             r.toggle = false;
             r.value = Tr(L"Offline only", L"Только офлайн");
         } else if (g_online && (i == kItemRepairSpeed || i == kItemRepairWhat)) {
