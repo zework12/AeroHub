@@ -1,4 +1,4 @@
-﻿#include "Features.hpp"
+#include "Features.hpp"
 
 #include <windows.h>
 
@@ -1567,7 +1567,7 @@ void UpdateGroup(int team, bool offline) {
 }
 
 // FireWeapon (the game's own call, as the AI scripts use it) for every ready gun of the group, in one frame, at the same point.
-// Beam guns are skipped: they need EndFireWeapon after a hold time, which is not handled here.
+// Beam guns (lasers) go through the same call: one call starts the beam, like a single click of the player.
 void GroupFireOnline(int team, const Vec3& target);
 
 void GroupFire() {
@@ -1590,18 +1590,12 @@ void GroupFire() {
         GroupFireOnline(team, target);
         return;
     }
-    int fired = 0, notReady = 0, beams = 0, faulted = 0;
+    int fired = 0, notReady = 0, faulted = 0;
     std::string codes;
     for (int id : g_state.group) {
         bool ready = false;
         if (g_api.WeaponReady(id, ready) && !ready) {
             ++notReady;
-            continue;
-        }
-        std::string projectile;
-        float gravity = 0.0f;
-        if (g_api.WeaponProjectile(id, team, projectile, gravity) && std::fabs(gravity) < 0.001f) {
-            ++beams;
             continue;
         }
         int result = 0, contextBefore = 0;
@@ -1613,8 +1607,8 @@ void GroupFire() {
         codes += " " + std::to_string(id) + ":" + std::to_string(result);
         if (fired == 1) codes += "(script team context was " + std::to_string(contextBefore) + ")";
     }
-    Logf("group fire at (%.0f, %.0f): %d called, %d not ready, %d beam gun(s) skipped, %d faulted; raw FIRE_* codes (gun:code)%s",
-         target.x, target.y, fired, notReady, beams, faulted, codes.c_str());
+    Logf("group fire at (%.0f, %.0f): %d called, %d not ready, %d faulted; raw FIRE_* codes (gun:code)%s",
+         target.x, target.y, fired, notReady, faulted, codes.c_str());
 }
 
 // "Battery: target + fire": the point under the mouse becomes the target of the whole group, which fires a salvo at it. Turns the
@@ -1666,6 +1660,10 @@ bool PrepareCalibration(int w, int h) {
             Logf("overlay: camera calibration failed (focus not at viewport centre?)");
         }
         return false;
+    }
+    if (g_state.warnedCalibration) {
+        g_state.warnedCalibration = false;  // log the next failure again
+        Logf("overlay: camera calibration works again");
     }
     if (!g_state.loggedCalibration) {
         g_state.loggedCalibration = true;
@@ -1796,14 +1794,28 @@ void DrawTrajectories(int team) {
     float line[2 * kTraceCap];
     int labels = 0;
     const float s = g_uiScale;
+    static DWORD lastReport = 0;
+    const bool report = GetTickCount() - lastReport > 5000;
+    if (report) lastReport = GetTickCount();
+    int hidden = 0, noRead = 0, propelled = 0, drawn = 0, offscreen = 0;
     for (int id : ids) {
         std::string type = "?";
         g_api.DeviceTypeName(id, type);
-        if (!ShowType(type)) continue;
+        if (!ShowType(type)) {
+            ++hidden;
+            continue;
+        }
         Vec3 p, v;
-        if (!g_api.BarrelPosition(id, p) || !g_api.FireVelocity(id, v)) continue;
+        if (!g_api.BarrelPosition(id, p) || !g_api.FireVelocity(id, v)) {
+            ++noRead;
+            continue;
+        }
         const float gravityMag = TypeGravity(id, team, type);
-        if (g_propelled.count(type)) continue;  // thrust-driven shells (missiles): the ballistic model does not describe them
+        if (g_propelled.count(type)) {  // thrust-driven shells (missiles): the ballistic model does not describe them
+            ++propelled;
+            continue;
+        }
+        ++drawn;
         const bool beam = gravityMag == 0.0f;
         const float gravityY = g_cal.gravitySign * gravityMag;
         const CachedTrace& tr = TraceCached({p.x, p.y}, {v.x, v.y}, gravityY, beam ? 0.0f : DragFor(type), beam);
@@ -1816,6 +1828,7 @@ void DrawTrajectories(int team) {
             line[2 * m + 1] = y;
             ++m;
         }
+        if (m < 2) ++offscreen;
         if (beam) g_overlay.Line(line, m, 0.4f, 0.9f, 1.0f, 0.9f, 2.0f);
         else g_overlay.Line(line, m, 1.0f, 0.85f, 0.1f, 0.9f, 2.0f);
         // Landing point: yellow on terrain, blue on water. The flight time is written for the first few guns only.
@@ -1839,6 +1852,9 @@ void DrawTrajectories(int team) {
                 if (DistanceToPolyline({e.pos.x, e.pos.y}, tr.pts.data(), n) < 70.0f) g_hitIds.insert(e.id);
         }
     }
+    if (report)
+        Logf("trajectory: %zu gun(s): %d drawn (%d off screen), %d hidden by type filter, %d unreadable, %d missiles", ids.size(), drawn,
+             offscreen, hidden, noRead, propelled);
 }
 
 // Group markers: a numbered ring on every group gun, a thin line from each to the group target, a cross on the target.
