@@ -256,3 +256,12 @@ td code { font: 500 13px "JetBrains Mono", Consolas, monospace; color: var(--tex
 .gamechip.free span { color: var(--ok); }
 .plan .game-tag { font-size: 12px; font-weight: 700; color: var(--accent); letter-spacing: .08em; text-transform: uppercase; }
 .gift { margin-top: 16px; display: flex; gap: 14px; align-items: center; } .gift .ico { margin: 0; }
+
+.check.strong { font-weight: 700; color: var(--accent); }
+.edit-row td { background: var(--side); }
+.editbox { display: grid; grid-template-columns: 2fr 1fr 1fr auto; gap: 16px; align-items: end; padding: 6px 0; }
+.editbox .checks { min-height: 0; }
+.editbtns { display: flex; gap: 8px; }
+.editbox .msg { grid-column: 1 / -1; margin: 0; min-height: 0; }
+.rolesel { height: 36px; width: auto; padding: 0 10px; }
+@media (max-width: 900px) { .editbox { grid-template-columns: 1fr; } }

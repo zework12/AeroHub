@@ -3,6 +3,7 @@
 //
 //   node server.js                         start on PORT (default 8080)
 //   node server.js make-admin <username>   give an existing account admin rights
+//   node server.js make-owner <username>   the owner also gives and takes admin rights on the site
 //   node server.js gen-keys <count> <days> [games] print new keys (days 0 = forever, games e.g. forts)
 import http from 'node:http';
 import fs from 'node:fs';
@@ -40,9 +41,21 @@ if (!db.prepare("SELECT 1 FROM pragma_table_info('keys') WHERE name = 'games'").
 // Paid games (id = the hub profile name in lower case) and games every account gets as a gift.
 const GAMES = { forts: 'Forts' };
 const FREE_GAMES = { minecraft: 'Minecraft' };
+// '*' = the whole hub: every paid game, including games added later.
+const ALL = '*';
 function parseGames(text) {
-  return [...new Set(String(text || '').split(',').map(g => g.trim().toLowerCase()).filter(g => GAMES[g]))];
+  const ids = String(text || '').split(',').map(g => g.trim().toLowerCase());
+  if (ids.includes(ALL)) return Object.keys(GAMES);
+  return [...new Set(ids.filter(g => GAMES[g]))];
 }
+// What to store for a key: '*' stays '*', otherwise the known game ids.
+function storedGames(input) {
+  const ids = Array.isArray(input) ? input.map(String) : String(input || '').split(',');
+  if (ids.map(g => g.trim()).includes(ALL)) return ALL;
+  return parseGames(ids.join(',')).join(',');
+}
+// Roles: 0 player, 1 admin (keys and users), 2 owner (also changes roles; cannot be demoted by anyone).
+const ROLE = { player: 0, admin: 1, owner: 2 };
 // Every paid game the account has through its active keys, with the latest end date (null = forever), plus the gifts.
 function accountGames(userId) {
   const out = new Map();
@@ -103,7 +116,7 @@ function keyStatus(k) {
 }
 function publicKey(k) {
   return { key: k.key, days: k.days, status: keyStatus(k), redeemed: k.redeemed, expires: k.expires, hwidBound: !!k.hwid,
-           games: parseGames(k.games).map(g => GAMES[g]) };
+           games: k.games === ALL ? ['Все игры'] : parseGames(k.games).map(g => GAMES[g]), allGames: k.games === ALL };
 }
 
 function parseCookies(req) {
@@ -217,7 +230,7 @@ const routes = {
     if (!user) return send(res, 401, { error: 'not signed in' });
     const keys = db.prepare('SELECT * FROM keys WHERE user_id = ? ORDER BY redeemed DESC').all(user.id).map(publicKey);
     const download = fs.existsSync(path.join(FILES, 'AeroHub-Setup.exe'));
-    send(res, 200, { username: user.username, admin: !!user.admin, keys, download, games: accountGames(user.id), catalog: GAMES });
+    send(res, 200, { username: user.username, admin: !!user.admin, owner: user.admin >= ROLE.owner, keys, download, games: accountGames(user.id), catalog: GAMES });
   },
 
   'POST /api/redeem': async (req, res, user) => {
@@ -278,25 +291,60 @@ const routes = {
   'GET /api/admin/overview': async (req, res, user) => {
     if (!user?.admin) return send(res, 403, { error: 'forbidden' });
     const keys = db.prepare(`SELECT k.*, u.username FROM keys k LEFT JOIN users u ON u.id = k.user_id ORDER BY k.created DESC LIMIT 500`).all()
-      .map(k => ({ ...publicKey(k), note: k.note, created: k.created, username: k.username, lastCheck: k.last_check }));
+      .map(k => ({ ...publicKey(k), gameIds: k.games === ALL ? [ALL] : parseGames(k.games), note: k.note, created: k.created,
+                   username: k.username, lastCheck: k.last_check }));
     const users = db.prepare('SELECT id, username, admin, created FROM users ORDER BY created DESC LIMIT 500').all();
-    send(res, 200, { keys, users, catalog: GAMES });
+    send(res, 200, { keys, users, catalog: GAMES, me: { id: user.id, owner: user.admin >= ROLE.owner } });
   },
   'POST /api/admin/keys': async (req, res, user) => {
     if (!user?.admin) return send(res, 403, { error: 'forbidden' });
     const { count, days, note, games } = await readJson(req);
-    const list = parseGames(Array.isArray(games) ? games.join(',') : games);
-    if (!list.length) return send(res, 400, { error: 'Выберите хотя бы одну игру' });
+    const list = storedGames(games);
+    if (!list) return send(res, 400, { error: 'Выберите хотя бы одну игру' });
     const c = Number(count), d = Number(days);
     if (!Number.isInteger(c) || c < 1 || c > 100) return send(res, 400, { error: 'Количество: 1–100' });
     if (!Number.isInteger(d) || d < 0 || d > 3650) return send(res, 400, { error: 'Дней: 0–3650 (0 = навсегда)' });
-    send(res, 200, { keys: makeKeys(c, d, String(note || '').slice(0, 80), list.join(',')) });
+    send(res, 200, { keys: makeKeys(c, d, String(note || '').slice(0, 80), list) });
   },
   'POST /api/admin/revoke': async (req, res, user) => {
     if (!user?.admin) return send(res, 403, { error: 'forbidden' });
     const { key, revoked } = await readJson(req);
     const r = db.prepare('UPDATE keys SET revoked = ? WHERE key = ?').run(revoked ? 1 : 0, String(key || ''));
     send(res, r.changes ? 200 : 404, { ok: !!r.changes });
+  },
+  // Edit a key: games, end date (null = forever; only for a key that is already activated) and note.
+  'POST /api/admin/key-edit': async (req, res, user) => {
+    if (!user?.admin) return send(res, 403, { error: 'forbidden' });
+    const { key, games, expires, days, note } = await readJson(req);
+    const k = db.prepare('SELECT * FROM keys WHERE key = ?').get(String(key || ''));
+    if (!k) return send(res, 404, { error: 'Ключ не найден' });
+    const list = storedGames(games);
+    if (!list) return send(res, 400, { error: 'Выберите хотя бы одну игру' });
+    let exp = k.expires, d = k.days;
+    if (k.user_id) {
+      if (expires === null) exp = null;
+      else {
+        exp = Number(expires);
+        if (!Number.isFinite(exp) || exp < 0 || exp > now() + 3650 * DAY) return send(res, 400, { error: 'Неверная дата' });
+      }
+    } else {
+      d = Number(days);
+      if (!Number.isInteger(d) || d < 0 || d > 3650) return send(res, 400, { error: 'Дней: 0–3650 (0 = навсегда)' });
+    }
+    db.prepare('UPDATE keys SET games = ?, expires = ?, days = ?, note = ? WHERE key = ?').run(list, exp, d, String(note || '').slice(0, 80), k.key);
+    send(res, 200, { ok: true });
+  },
+  // Roles: only the owner gives or takes admin rights; the owner role itself is not changed here.
+  'POST /api/admin/role': async (req, res, user) => {
+    if (!user || user.admin < ROLE.owner) return send(res, 403, { error: 'Роли меняет только владелец' });
+    const { userId, role } = await readJson(req);
+    const target = db.prepare('SELECT id, admin FROM users WHERE id = ?').get(Number(userId));
+    if (!target) return send(res, 404, { error: 'Пользователь не найден' });
+    if (target.admin >= ROLE.owner) return send(res, 400, { error: 'Роль владельца не меняется' });
+    if (role !== 'player' && role !== 'admin') return send(res, 400, { error: 'Неверная роль' });
+    db.prepare('UPDATE users SET admin = ? WHERE id = ?').run(ROLE[role], target.id);
+    if (ROLE[role] === 0) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);  // drop open admin sessions
+    send(res, 200, { ok: true });
   },
   'POST /api/admin/reset-hwid': async (req, res, user) => {
     if (!user?.admin) return send(res, 403, { error: 'forbidden' });
@@ -308,9 +356,9 @@ const routes = {
 
 // ---------------------------------------------------------------- CLI
 const [cmd, a1, a2] = process.argv.slice(2);
-if (cmd === 'make-admin') {
-  const r = db.prepare('UPDATE users SET admin = 1 WHERE username = ?').run(String(a1 || ''));
-  console.log(r.changes ? `${a1} is now an admin` : `no user ${a1}`);
+if (cmd === 'make-admin' || cmd === 'make-owner') {
+  const r = db.prepare('UPDATE users SET admin = ? WHERE username = ?').run(cmd === 'make-owner' ? ROLE.owner : ROLE.admin, String(a1 || ''));
+  console.log(r.changes ? `${a1} is now ${cmd === 'make-owner' ? 'the owner' : 'an admin'}` : `no user ${a1}`);
   process.exit(r.changes ? 0 : 1);
 } else if (cmd === 'gen-keys') {
   const c = Number(a1), d = Number(a2 ?? 30);
@@ -318,8 +366,7 @@ if (cmd === 'make-admin') {
     console.error('usage: node server.js gen-keys <count 1-1000> <days, 0 = forever>');
     process.exit(1);
   }
-  const games = parseGames(process.argv[5] || 'forts');
-  console.log(makeKeys(c, d, 'cli', games.join(',') || 'forts').join('\n'));
+  console.log(makeKeys(c, d, 'cli', storedGames(process.argv[5] || 'forts') || 'forts').join('\n'));
   process.exit(0);
 } else if (cmd) {
   console.error(`unknown command ${cmd}`);
