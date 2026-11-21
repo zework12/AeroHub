@@ -278,3 +278,12 @@ html { color-scheme: dark; scrollbar-color: var(--lineHi) transparent; }
 td, th { white-space: nowrap; }
 td:last-child { text-align: right; }
 .tablebox { scrollbar-width: thin; }
+
+.filters { display: flex; gap: 12px; align-items: flex-end; flex-wrap: wrap; margin: 8px 0 4px; }
+.filters > div { min-width: 200px; }
+.filters .count { color: var(--faint); font-size: 13px; padding-bottom: 14px; margin-left: auto; min-width: 0; }
+.role { font-weight: 700; }
+.role.owner { color: var(--accent); }
+.role.head { color: #8fb8ff; }
+.role.admin { color: var(--ok); }
+.role.player { color: var(--dim); font-weight: 500; }

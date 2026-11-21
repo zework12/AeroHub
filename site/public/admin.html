@@ -32,8 +32,14 @@
 
   <div class="card">
     <h3>Ключи</h3>
+    <div class="filters">
+      <div id="whobox"><label for="who">Кто выпустил</label>
+        <select id="who"><option value="all">Все</option><option value="mine">Мои</option><option value="head">Главные админы</option><option value="admin">Админы</option></select></div>
+      <div><label for="q">Поиск</label><input id="q" placeholder="ник, ключ или заметка"></div>
+      <div class="count" id="count"></div>
+    </div>
     <div class="tablebox"><table>
-      <thead><tr><th>Ключ</th><th>Статус</th><th>Игры</th><th>Дней</th><th>Владелец</th><th>До</th><th>ПК</th><th>Заметка</th><th></th></tr></thead>
+      <thead><tr><th>Ключ</th><th>Статус</th><th>Игры</th><th>Дней</th><th>Выпустил</th><th>Активировал</th><th>До</th><th>ПК</th><th>Заметка</th><th></th></tr></thead>
       <tbody id="keys"></tbody>
     </table></div>
   </div>
@@ -49,7 +55,8 @@
 </div></div>
 <script src="app.js"></script>
 <script>
-let catalog = {}, me = {};
+let catalog = {}, me = {}, allKeys = [];
+const ROLE_RU = { player: 'игрок', admin: 'админ', head: 'главный админ', owner: 'владелец' };
 // Game checkboxes: "Весь хаб" (every game, including future ones) or individual games.
 function gamePicker(selected) {
   const all = selected.includes('*');
@@ -98,7 +105,7 @@ function editor(k, row) {
     load();
   } }, 'Сохранить');
   const cancel = el('button', { class: 'btn small', type: 'button', onclick: () => tr.remove() }, 'Отмена');
-  const tr = el('tr', { class: 'edit-row' }, el('td', { colspan: 9 },
+  const tr = el('tr', { class: 'edit-row' }, el('td', { colspan: 10 },
     el('div', { class: 'editbox' },
       el('div', {}, el('label', {}, 'Игры'), picker), when,
       el('div', {}, el('label', {}, 'Заметка'), note),
@@ -106,18 +113,15 @@ function editor(k, row) {
   row.after(tr);
 }
 
-async function load() {
-  const r = await api('/api/admin/overview');
-  if (r.status === 401) return (location.href = '/login');
-  if (!r.ok) return (location.href = '/account');
-  catalog = r.data.catalog || {};
-  me = r.data.me || {};
-  const gslot = document.getElementById('games');
-  if (!gslot.children.length) { const p = gamePicker(Object.keys(catalog)); p.id = 'picker'; gslot.append(p); }
+function renderKeys() {
+  const who = document.getElementById('who').value, q = document.getElementById('q').value.trim().toLowerCase();
+  const list = allKeys.filter(k => (who === 'all' || (who === 'mine' ? k.mine : !k.mine && k.creatorRole === who)) &&
+    (!q || [k.key, k.creator, k.username, k.note].some(v => String(v || '').toLowerCase().includes(q))));
+  document.getElementById('count').textContent = `Показано: ${list.length} из ${allKeys.length}`;
   const keys = document.getElementById('keys');
   keys.replaceChildren();
-  if (!r.data.keys.length) keys.append(el('tr', {}, el('td', { colspan: 9, class: 'empty' }, 'Ключей пока нет')));
-  for (const k of r.data.keys) {
+  if (!list.length) keys.append(el('tr', {}, el('td', { colspan: 10, class: 'empty' }, allKeys.length ? 'Ничего не найдено' : 'Ключей пока нет')));
+  for (const k of list) {
     const revoke = el('button', { class: 'btn small', onclick: async () => {
       await api('/api/admin/revoke', { key: k.key, revoked: k.status !== 'revoked' });
       load();
@@ -132,6 +136,7 @@ async function load() {
       el('td', {}, el('span', { class: `pill ${k.status}` }, STATUS_RU[k.status] || k.status)),
       el('td', {}, k.allGames ? el('span', { class: 'pill free' }, 'Весь хаб') : (k.games || []).join(', ')),
       el('td', {}, k.days || '∞'),
+      el('td', {}, k.creator ? el('span', { class: 'role ' + k.creatorRole, title: ROLE_RU[k.creatorRole] }, k.creator) : '—'),
       el('td', {}, k.username || '—'),
       el('td', {}, k.expires ? fmtDate(k.expires) : (k.username ? 'навсегда' : '—')),
       el('td', {}, k.hwidBound ? 'да' : 'нет'),
@@ -143,18 +148,32 @@ async function load() {
     row.append(el('td', { style: 'white-space:nowrap' }, edit, ' ', revoke, ' ', reset));
     keys.append(row);
   }
-  const ROLE_RU = ['игрок', 'админ', 'владелец'];
+}
+document.getElementById('who').addEventListener('change', renderKeys);
+document.getElementById('q').addEventListener('input', renderKeys);
+
+async function load() {
+  const r = await api('/api/admin/overview');
+  if (r.status === 401) return (location.href = '/login');
+  if (!r.ok) return (location.href = '/account');
+  catalog = r.data.catalog || {};
+  me = r.data.me || {};
+  const gslot = document.getElementById('games');
+  if (!gslot.children.length) { const p = gamePicker(Object.keys(catalog)); p.id = 'picker'; gslot.append(p); }
+  allKeys = r.data.keys;
+  document.getElementById('whobox').hidden = me.role === 'admin';
+  renderKeys();
   const users = document.getElementById('users');
   users.replaceChildren(...r.data.users.map(u => {
     let role;
-    if (me.owner && u.admin < 2) {
+    if (me.owner && u.role !== 'owner') {
       role = el('select', { class: 'rolesel', onchange: async (ev) => {
         const res = await api('/api/admin/role', { userId: u.id, role: ev.target.value });
         toast(res.ok ? 'Роль изменена' : (res.data.error || 'Ошибка'));
         load();
-      } }, el('option', { value: 'player' }, 'игрок'), el('option', { value: 'admin' }, 'админ'));
-      role.value = u.admin ? 'admin' : 'player';
-    } else role = ROLE_RU[u.admin] || 'игрок';
+      } }, el('option', { value: 'player' }, 'игрок'), el('option', { value: 'admin' }, 'админ'), el('option', { value: 'head' }, 'главный админ'));
+      role.value = u.role;
+    } else role = el('span', { class: 'role ' + u.role }, ROLE_RU[u.role] || 'игрок');
     return el('tr', {}, el('td', {}, u.username), el('td', {}, role), el('td', {}, fmtDate(u.created)));
   }));
   document.getElementById('roles-note').hidden = !!me.owner;

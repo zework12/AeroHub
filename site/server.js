@@ -54,8 +54,29 @@ function storedGames(input) {
   if (ids.map(g => g.trim()).includes(ALL)) return ALL;
   return parseGames(ids.join(',')).join(',');
 }
-// Roles: 0 player, 1 admin (keys and users), 2 owner (also changes roles; cannot be demoted by anyone).
-const ROLE = { player: 0, admin: 1, owner: 2 };
+// Roles: 0 player; 1 admin: issues keys and sees only his own; 2 head admin: sees every key except the owner's;
+// 3 owner: sees everything and is the only one who changes roles.
+const ROLE = { player: 0, admin: 1, head: 2, owner: 3 };
+const ROLE_NAMES = ['player', 'admin', 'head', 'owner'];
+// Schema v1: keys remember who issued them; the owner moved from role 2 to 3.
+if (db.prepare('PRAGMA user_version').get().user_version < 1) {
+  if (!db.prepare("SELECT 1 FROM pragma_table_info('keys') WHERE name = 'created_by'").get())
+    db.exec('ALTER TABLE keys ADD COLUMN created_by INTEGER REFERENCES users(id) ON DELETE SET NULL');
+  db.exec('UPDATE users SET admin = 3 WHERE admin = 2; PRAGMA user_version = 1');
+}
+// Keys without a creator (issued from the command line or before v1) count as the owner's.
+function keyOwnerRole(k) { return k.creator_role ?? ROLE.owner; }
+function canSeeKey(user, k) {
+  if (user.admin >= ROLE.owner) return true;
+  if (user.admin >= ROLE.head) return keyOwnerRole(k) < ROLE.owner;
+  return k.created_by === user.id;
+}
+const KEY_SELECT = `SELECT k.*, u.username, c.username AS creator, c.admin AS creator_role FROM keys k
+  LEFT JOIN users u ON u.id = k.user_id LEFT JOIN users c ON c.id = k.created_by`;
+function adminKey(user, key) {
+  const k = db.prepare(`${KEY_SELECT} WHERE k.key = ?`).get(String(key || ''));
+  return k && canSeeKey(user, k) ? k : null;
+}
 // Every paid game the account has through its active keys, with the latest end date (null = forever), plus the gifts.
 function accountGames(userId) {
   const out = new Map();
@@ -98,12 +119,12 @@ function newKey() {
   for (let i = 0; i < 16; i++) s += KEY_ALPHABET[bytes[i] % KEY_ALPHABET.length];
   return `AERO-${s.slice(0, 4)}-${s.slice(4, 8)}-${s.slice(8, 12)}-${s.slice(12, 16)}`;
 }
-function makeKeys(count, days, note = '', games = 'forts') {
-  const insert = db.prepare('INSERT INTO keys (key, days, note, created, games) VALUES (?, ?, ?, ?, ?)');
+function makeKeys(count, days, note = '', games = 'forts', createdBy = null) {
+  const insert = db.prepare('INSERT INTO keys (key, days, note, created, games, created_by) VALUES (?, ?, ?, ?, ?, ?)');
   const out = [];
   for (let i = 0; i < count; i++) {
     const k = newKey();
-    insert.run(k, days, note, now(), games);
+    insert.run(k, days, note, now(), games, createdBy);
     out.push(k);
   }
   return out;
@@ -290,11 +311,13 @@ const routes = {
   // ---------------- admin
   'GET /api/admin/overview': async (req, res, user) => {
     if (!user?.admin) return send(res, 403, { error: 'forbidden' });
-    const keys = db.prepare(`SELECT k.*, u.username FROM keys k LEFT JOIN users u ON u.id = k.user_id ORDER BY k.created DESC LIMIT 500`).all()
+    const keys = db.prepare(`${KEY_SELECT} ORDER BY k.created DESC LIMIT 2000`).all().filter(k => canSeeKey(user, k))
       .map(k => ({ ...publicKey(k), gameIds: k.games === ALL ? [ALL] : parseGames(k.games), note: k.note, created: k.created,
-                   username: k.username, lastCheck: k.last_check }));
-    const users = db.prepare('SELECT id, username, admin, created FROM users ORDER BY created DESC LIMIT 500').all();
-    send(res, 200, { keys, users, catalog: GAMES, me: { id: user.id, owner: user.admin >= ROLE.owner } });
+                   username: k.username, lastCheck: k.last_check, creator: k.creator || '', creatorRole: ROLE_NAMES[keyOwnerRole(k)],
+                   mine: k.created_by === user.id || (!k.created_by && user.admin >= ROLE.owner) }));
+    const users = db.prepare('SELECT id, username, admin, created FROM users ORDER BY created DESC LIMIT 2000').all()
+      .map(u => ({ id: u.id, username: u.username, role: ROLE_NAMES[u.admin] || 'player', created: u.created }));
+    send(res, 200, { keys, users, catalog: GAMES, me: { id: user.id, role: ROLE_NAMES[user.admin], owner: user.admin >= ROLE.owner } });
   },
   'POST /api/admin/keys': async (req, res, user) => {
     if (!user?.admin) return send(res, 403, { error: 'forbidden' });
@@ -304,19 +327,21 @@ const routes = {
     const c = Number(count), d = Number(days);
     if (!Number.isInteger(c) || c < 1 || c > 100) return send(res, 400, { error: 'Количество: 1–100' });
     if (!Number.isInteger(d) || d < 0 || d > 3650) return send(res, 400, { error: 'Дней: 0–3650 (0 = навсегда)' });
-    send(res, 200, { keys: makeKeys(c, d, String(note || '').slice(0, 80), list) });
+    send(res, 200, { keys: makeKeys(c, d, String(note || '').slice(0, 80), list, user.id) });
   },
   'POST /api/admin/revoke': async (req, res, user) => {
     if (!user?.admin) return send(res, 403, { error: 'forbidden' });
     const { key, revoked } = await readJson(req);
-    const r = db.prepare('UPDATE keys SET revoked = ? WHERE key = ?').run(revoked ? 1 : 0, String(key || ''));
-    send(res, r.changes ? 200 : 404, { ok: !!r.changes });
+    const k = adminKey(user, key);
+    if (!k) return send(res, 404, { error: 'Ключ не найден' });
+    db.prepare('UPDATE keys SET revoked = ? WHERE key = ?').run(revoked ? 1 : 0, k.key);
+    send(res, 200, { ok: true });
   },
   // Edit a key: games, end date (null = forever; only for a key that is already activated) and note.
   'POST /api/admin/key-edit': async (req, res, user) => {
     if (!user?.admin) return send(res, 403, { error: 'forbidden' });
     const { key, games, expires, days, note } = await readJson(req);
-    const k = db.prepare('SELECT * FROM keys WHERE key = ?').get(String(key || ''));
+    const k = adminKey(user, key);
     if (!k) return send(res, 404, { error: 'Ключ не найден' });
     const list = storedGames(games);
     if (!list) return send(res, 400, { error: 'Выберите хотя бы одну игру' });
@@ -334,23 +359,25 @@ const routes = {
     db.prepare('UPDATE keys SET games = ?, expires = ?, days = ?, note = ? WHERE key = ?').run(list, exp, d, String(note || '').slice(0, 80), k.key);
     send(res, 200, { ok: true });
   },
-  // Roles: only the owner gives or takes admin rights; the owner role itself is not changed here.
+  // Roles: only the owner gives or takes rights; the owner role itself is not changed here.
   'POST /api/admin/role': async (req, res, user) => {
     if (!user || user.admin < ROLE.owner) return send(res, 403, { error: 'Роли меняет только владелец' });
     const { userId, role } = await readJson(req);
     const target = db.prepare('SELECT id, admin FROM users WHERE id = ?').get(Number(userId));
     if (!target) return send(res, 404, { error: 'Пользователь не найден' });
     if (target.admin >= ROLE.owner) return send(res, 400, { error: 'Роль владельца не меняется' });
-    if (role !== 'player' && role !== 'admin') return send(res, 400, { error: 'Неверная роль' });
+    if (!['player', 'admin', 'head'].includes(role)) return send(res, 400, { error: 'Неверная роль' });
     db.prepare('UPDATE users SET admin = ? WHERE id = ?').run(ROLE[role], target.id);
-    if (ROLE[role] === 0) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);  // drop open admin sessions
+    if (ROLE[role] < target.admin) db.prepare('DELETE FROM sessions WHERE user_id = ?').run(target.id);  // rights reduced: sign out
     send(res, 200, { ok: true });
   },
   'POST /api/admin/reset-hwid': async (req, res, user) => {
     if (!user?.admin) return send(res, 403, { error: 'forbidden' });
     const { key } = await readJson(req);
-    const r = db.prepare('UPDATE keys SET hwid = NULL WHERE key = ?').run(String(key || ''));
-    send(res, r.changes ? 200 : 404, { ok: !!r.changes });
+    const k = adminKey(user, key);
+    if (!k) return send(res, 404, { error: 'Ключ не найден' });
+    db.prepare('UPDATE keys SET hwid = NULL WHERE key = ?').run(k.key);
+    send(res, 200, { ok: true });
   },
 };
 
