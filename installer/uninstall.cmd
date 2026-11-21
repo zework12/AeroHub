@@ -8,6 +8,7 @@ if not exist "%DIR%AeroHub.exe" (
     exit /b 1
 )
 del /q "%APPDATA%\Microsoft\Windows\Start Menu\Programs\%AEROHUB_NAME%.lnk" 2>nul
+powershell -NoProfile -Command "Remove-Item -LiteralPath ([Environment]::GetFolderPath('Desktop')+'\'+$env:AEROHUB_NAME+'.lnk') -ErrorAction SilentlyContinue"
 reg delete "HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\%AEROHUB_NAME%" /f >nul 2>&1
 rem This script lives inside the folder, so the folder is removed by a detached helper after a short delay.
 start "" /b cmd /c "ping -n 3 127.0.0.1 >nul & rmdir /s /q "%DIR:~0,-1%""
