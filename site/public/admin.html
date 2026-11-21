@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Админка · AeroHub</title>
+<link rel="icon" href="img/icon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="ambient" aria-hidden="true"></div>
+<header class="top"><div class="wrap">
+  <a class="brand" href="/"><span class="mark">A</span>AeroHub</a>
+  <nav class="links"><a href="/account">Кабинет</a></nav>
+</div></header>
+<div class="page"><div class="wrap stack">
+  <h1 style="margin:0">Админка</h1>
+
+  <div class="card">
+    <h3>Выпустить ключи</h3>
+    <form id="gen" class="row" style="margin-top:6px">
+      <div><label for="c">Сколько</label><input id="c" name="count" type="number" min="1" max="100" value="1" required></div>
+      <div><label for="d">Тариф</label>
+        <select id="d" name="days"><option value="7">Неделя</option><option value="30" selected>Месяц</option><option value="0">Навсегда</option></select></div>
+      <div><label>Игры</label><div id="games" class="checks"></div></div>
+      <div><label for="n">Заметка</label><input id="n" name="note" maxlength="80" placeholder="кому / за что"></div>
+      <button class="btn primary" type="submit">Выпустить</button>
+      <div class="msg" style="flex-basis:100%"></div>
+    </form>
+    <div id="newkeys" class="newkeys" hidden></div>
+  </div>
+
+  <div class="card">
+    <h3>Ключи</h3>
+    <div class="tablebox"><table>
+      <thead><tr><th>Ключ</th><th>Статус</th><th>Игры</th><th>Дней</th><th>Владелец</th><th>До</th><th>ПК</th><th>Заметка</th><th></th></tr></thead>
+      <tbody id="keys"></tbody>
+    </table></div>
+  </div>
+
+  <div class="card">
+    <h3>Пользователи</h3>
+    <div class="tablebox"><table>
+      <thead><tr><th>Логин</th><th>Роль</th><th>Создан</th></tr></thead>
+      <tbody id="users"></tbody>
+    </table></div>
+  </div>
+</div></div>
+<script src="app.js"></script>
+<script>
+async function load() {
+  const r = await api('/api/admin/overview');
+  if (r.status === 401) return (location.href = '/login');
+  if (!r.ok) return (location.href = '/account');
+  const gbox = document.getElementById('games');
+  if (!gbox.children.length) for (const [id, name] of Object.entries(r.data.catalog || {}))
+    gbox.append(el('label', { class: 'check' }, el('input', { type: 'checkbox', name: 'game', value: id, checked: '' }), name));
+  const keys = document.getElementById('keys');
+  keys.replaceChildren();
+  for (const k of r.data.keys) {
+    const revoke = el('button', { class: 'btn small', onclick: async () => {
+      await api('/api/admin/revoke', { key: k.key, revoked: k.status !== 'revoked' });
+      load();
+    } }, k.status === 'revoked' ? 'Вернуть' : 'Отозвать');
+    const reset = el('button', { class: 'btn small', onclick: async () => {
+      await api('/api/admin/reset-hwid', { key: k.key });
+      load();
+    } }, 'Сброс ПК');
+    if (!k.hwidBound) reset.disabled = true;
+    keys.append(el('tr', {},
+      el('td', { style: 'white-space:nowrap' }, el('code', {}, k.key), ' ', copyButton(k.key)),
+      el('td', {}, el('span', { class: `pill ${k.status}` }, STATUS_RU[k.status] || k.status)),
+      el('td', {}, (k.games || []).join(', ')),
+      el('td', {}, k.days || '∞'),
+      el('td', {}, k.username || '—'),
+      el('td', {}, k.expires ? fmtDate(k.expires) : (k.username ? 'навсегда' : '—')),
+      el('td', {}, k.hwidBound ? 'да' : 'нет'),
+      el('td', {}, k.note || ''),
+      el('td', { style: 'white-space:nowrap' }, revoke, ' ', reset)));
+  }
+  const users = document.getElementById('users');
+  users.replaceChildren(...r.data.users.map(u => el('tr', {},
+    el('td', {}, u.username), el('td', {}, u.admin ? 'админ' : 'игрок'), el('td', {}, fmtDate(u.created)))));
+}
+bindForm(document.getElementById('gen'), async (v) => {
+  const games = [...document.querySelectorAll('#games input:checked')].map(i => i.value);
+  const r = await api('/api/admin/keys', { count: Number(v.count), days: Number(v.days), note: v.note, games });
+  if (!r.ok) throw new Error(r.data.error || 'Ошибка');
+  const box = document.getElementById('newkeys');
+  box.hidden = false;
+  box.textContent = r.data.keys.join('\n');
+  load();
+  return `Выпущено: ${r.data.keys.length}`;
+});
+load();
+</script>
+</body>
+</html>

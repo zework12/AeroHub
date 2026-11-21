@@ -18,6 +18,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <map>
 #include <filesystem>
 #include <fstream>
@@ -31,6 +32,7 @@
 #include "Diagnostics.hpp"
 #include "Inject.hpp"
 #include "Ipc.hpp"
+#include "License.hpp"
 #include "Minecraft.hpp"
 #include "SlimeRancher.hpp"
 #include "Pe.hpp"
@@ -54,7 +56,8 @@ using namespace aero::ui;
 
 constexpr UINT_PTR kTimer = 1;
 constexpr UINT kMsgUpdate = WM_APP + 1;  // wParam: 1 = the version check finished, 2 = the installer download finished
-constexpr UINT_PTR kEditHub = 301, kEditModule = 302;
+constexpr UINT_PTR kEditHub = 301, kEditModule = 302, kEditKey = 303;
+constexpr UINT kMsgLicense = WM_APP + 2;  // the licence check finished
 constexpr double kMinProcessAgeForAutoInject = 8.0;  // seconds; lets the game finish resolving its imports
 constexpr int kStaleTicksBeforeWarning = 3;
 
@@ -76,7 +79,7 @@ struct Link {
     Level level = Level::Idle;
 };
 
-enum class Act { None, SelectGame, Primary, Secondary, Refresh, AutoSwitch, TabModule, TabHub, CollectLogs, SwitchOpenGl, Update, LangEn, LangRu, SrPart, LogToggle, WinMin, WinMax, WinClose };
+enum class Act { None, SelectGame, Primary, Secondary, Refresh, AutoSwitch, TabModule, TabHub, CollectLogs, SwitchOpenGl, Update, LangEn, LangRu, SrPart, LogToggle, WinMin, WinMax, WinClose, LicenseActivate, LicenseSite, LicenseAccount, LicenseSignOut };
 struct Hit {
     RectF r;
     Act act = Act::None;
@@ -85,12 +88,13 @@ struct Hit {
 };
 
 // ---------------------------------------------------------------- state
-HWND g_hwnd, g_editHub, g_editModule;
+HWND g_hwnd, g_editHub, g_editModule, g_editKey;
 HBRUSH g_surfaceBrush;
 HFONT g_editFont;
 int g_dpi = 96;
 std::filesystem::path g_dir, g_settingsFile;
 std::vector<aero::GameProfile> g_profiles;
+std::vector<aero::GameProfile> g_allProfiles;  // every installed profile; g_profiles holds the ones the licence opens
 std::filesystem::path g_modrinthRoot;                 // AeroHub.ini [Hub] ModrinthRoot: a Modrinth data folder in a non-default place
 std::vector<std::filesystem::path> g_extraInstances;  // AeroHub.ini [Hub] MinecraftInstances: extra game folders, ';' separated
 
@@ -1251,9 +1255,184 @@ Lay Compute(int w, int h, float logOpenT) {
 
 float g_logOpenT = 1.0f;  // eased 0..1, read by PositionLogs between frames
 
+// ---------------------------------------------------------------- licence
+// The hub works only with a key that the site confirms for this machine. A confirmed key stays valid offline for
+// kLicenseGraceSec (the site may be unreachable for a while); the check is repeated every kLicenseRecheckSec.
+enum class Lic { Checking, Ok, Need };
+Lic g_lic = Lic::Checking;
+std::wstring g_licKey, g_licMsg, g_licUser;
+long long g_licExpiresMs = 0;  // 0 = forever
+std::wstring g_licGames;  // comma-separated game ids from the site, e.g. "forts,minecraft"
+
+// Show only the games the account owns (the site adds the gifts). The demo shows everything.
+void ApplyLicensedGames() {
+    std::vector<std::wstring> allowed;
+    for (std::size_t start = 0; start <= g_licGames.size();) {
+        std::size_t end = g_licGames.find(L',', start);
+        if (end == std::wstring::npos) end = g_licGames.size();
+        if (end > start) allowed.push_back(g_licGames.substr(start, end - start));
+        start = end + 1;
+    }
+    g_profiles.clear();
+    for (const auto& p : g_allProfiles) {
+        std::wstring id = p.name;
+        for (auto& c : id) c = static_cast<wchar_t>(towlower(c));
+        if (g_demo || std::find(allowed.begin(), allowed.end(), id) != allowed.end()) g_profiles.push_back(p);
+    }
+    g_sel = 0;
+    g_autoTriedPid.clear();
+}
+bool g_licBusy = false;
+double g_licLastCheck = 0;
+aero::license::Result g_licResult;
+std::mutex g_licLock;
+constexpr long long kLicenseGraceSec = 3 * 86400;
+constexpr double kLicenseRecheckSec = 6 * 3600;
+
+long long UnixNow() { return static_cast<long long>(std::time(nullptr)); }
+
+void StartLicenseCheck(const std::wstring& key) {
+    if (g_licBusy) return;
+    g_licBusy = true;
+    const HWND hwnd = g_hwnd;
+    std::thread([hwnd, key] {
+        aero::license::Result r;
+        const std::string id = aero::license::MachineId();
+        if (id.empty()) r.error = L"cannot read the machine id";
+        else r = aero::license::Check(key, id);
+        {
+            std::lock_guard<std::mutex> lock(g_licLock);
+            g_licResult = r;
+        }
+        PostMessageW(hwnd, kMsgLicense, 0, 0);
+    }).detach();
+}
+
+std::wstring LicenseReasonText(const std::string& reason) {
+    if (reason == "not redeemed") return Tr(L"This key is not activated yet: activate it on the site first.", L"Ключ ещё не активирован: активируйте его на сайте.");
+    if (reason == "expired") return Tr(L"This key has expired.", L"Срок действия ключа закончился.");
+    if (reason == "revoked") return Tr(L"This key was revoked.", L"Ключ отозван.");
+    if (reason == "other machine") return Tr(L"This key is bound to another computer. Reset it on the site.", L"Ключ привязан к другому компьютеру. Сбросьте привязку на сайте.");
+    if (reason == "rate") return Tr(L"Too many attempts, try again in a few minutes.", L"Слишком много попыток, попробуйте через несколько минут.");
+    return Tr(L"Key not found.", L"Ключ не найден.");
+}
+
+void PositionLogs();
+
+void OnLicenseMessage() {
+    g_licBusy = false;
+    g_licLastCheck = NowSec();
+    aero::license::Result r;
+    {
+        std::lock_guard<std::mutex> lock(g_licLock);
+        r = g_licResult;
+    }
+    const Lic before = g_lic;
+    if (r.reached && r.ok) {
+        long long until = UnixNow() + kLicenseGraceSec;
+        if (r.expiresMs > 0) until = std::min(until, r.expiresMs / 1000);
+        WritePrivateProfileStringW(L"License", L"Key", g_licKey.c_str(), g_settingsFile.c_str());
+        WritePrivateProfileStringW(L"License", L"OkUntil", std::to_wstring(until).c_str(), g_settingsFile.c_str());
+        g_licUser.assign(r.username.begin(), r.username.end());
+        std::wstring games;
+        for (const auto& id : r.games) games += (games.empty() ? L"" : L",") + std::wstring(id.begin(), id.end());
+        WritePrivateProfileStringW(L"License", L"Games", games.c_str(), g_settingsFile.c_str());
+        if (games != g_licGames || before != Lic::Ok) {
+            g_licGames = games;
+            ApplyLicensedGames();
+            Refresh();
+        }
+        g_licExpiresMs = r.expiresMs;
+        WritePrivateProfileStringW(L"License", L"User", g_licUser.c_str(), g_settingsFile.c_str());
+        WritePrivateProfileStringW(L"License", L"Expires", std::to_wstring(g_licExpiresMs).c_str(), g_settingsFile.c_str());
+        g_lic = Lic::Ok;
+        g_licMsg.clear();
+        if (before != Lic::Ok) Log(L"licence: key confirmed by the site");
+    } else if (r.reached) {
+        WritePrivateProfileStringW(L"License", L"OkUntil", L"0", g_settingsFile.c_str());
+        g_lic = Lic::Need;
+        g_licMsg = LicenseReasonText(r.reason);
+        Log(L"licence: refused (" + std::wstring(r.reason.begin(), r.reason.end()) + L")");
+    } else {
+        wchar_t buf[32]{};
+        GetPrivateProfileStringW(L"License", L"OkUntil", L"0", buf, static_cast<DWORD>(std::size(buf)), g_settingsFile.c_str());
+        const long long until = _wtoi64(buf);
+        if (until > UnixNow() && !g_licKey.empty()) {
+            g_lic = Lic::Ok;  // offline grace
+            if (before != Lic::Ok) Log(L"licence: site unreachable (" + r.error + L"), using the last confirmation");
+        } else {
+            g_lic = Lic::Need;
+            g_licMsg = Tr(L"The site cannot be reached. Check the internet connection and try again.", L"Не удаётся связаться с сайтом. Проверьте интернет и попробуйте ещё раз.");
+            Log(L"licence: site unreachable (" + r.error + L")");
+        }
+    }
+    if (g_lic != before) {
+        g_pageStart = NowSec();
+        PositionLogs();
+    }
+    Redraw();
+}
+
+// Sign out on this computer: the site forgets this machine for the key, and the hub forgets the key.
+void SignOut() {
+    if (MessageBoxW(g_hwnd, Tr(L"Remove the key from this computer? The key stays yours: you can use it on another computer.",
+                               L"Убрать ключ с этого компьютера? Ключ останется вашим — его можно будет ввести на другом компьютере."),
+                    L"AeroHub", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        return;
+    const std::wstring key = g_licKey;
+    std::thread([key] {
+        const std::string id = aero::license::MachineId();
+        if (!id.empty()) aero::license::Release(key, id);
+    }).detach();
+    for (const wchar_t* k : {L"Key", L"OkUntil", L"User", L"Expires", L"Games"}) WritePrivateProfileStringW(L"License", k, nullptr, g_settingsFile.c_str());
+    g_licGames.clear();
+    ApplyLicensedGames();
+    g_licKey.clear();
+    g_licUser.clear();
+    g_licExpiresMs = 0;
+    g_licMsg.clear();
+    SetWindowTextW(g_editKey, L"");
+    g_lic = Lic::Need;
+    g_pageStart = NowSec();
+    Log(L"licence: signed out on this computer");
+    PositionLogs();
+}
+
+std::wstring LicenseLeftText() {
+    if (g_licExpiresMs <= 0) return Tr(L"Forever", L"Навсегда");
+    const long long left = g_licExpiresMs / 1000 - UnixNow();
+    if (left <= 0) return Tr(L"Expired", L"Истёк");
+    const long long days = left / 86400, hours = (left % 86400) / 3600;
+    if (days >= 1) return std::to_wstring(days) + Tr(L" d left", L" дн. осталось");
+    return std::to_wstring(std::max(1LL, hours)) + Tr(L" h left", L" ч осталось");
+}
+
+void ActivateFromEdit() {
+    wchar_t buf[96]{};
+    GetWindowTextW(g_editKey, buf, static_cast<int>(std::size(buf)));
+    const std::wstring key = aero::license::NormalizeKey(buf);
+    if (key.empty()) {
+        g_licMsg = Tr(L"A key looks like AERO-XXXX-XXXX-XXXX-XXXX.", L"Ключ выглядит так: AERO-XXXX-XXXX-XXXX-XXXX.");
+        return;
+    }
+    g_licKey = key;
+    g_licMsg.clear();
+    StartLicenseCheck(key);
+}
+
 void PositionLogs() {
     RECT rc;
     GetClientRect(g_hwnd, &rc);
+    if (g_lic != Lic::Ok) {
+        ShowWindow(g_editModule, SW_HIDE);
+        ShowWindow(g_editHub, SW_HIDE);
+        const float cw = S(480), ch = S(330);
+        const float cx = (rc.right - cw) / 2, cy = (rc.bottom - ch) / 2;
+        MoveWindow(g_editKey, static_cast<int>(cx + S(40)), static_cast<int>(cy + S(150)), static_cast<int>(cw - S(80)), static_cast<int>(S(24)), TRUE);
+        ShowWindow(g_editKey, g_lic == Lic::Need ? SW_SHOW : SW_HIDE);
+        return;
+    }
+    ShowWindow(g_editKey, SW_HIDE);
     const Lay L = Compute(rc.right, rc.bottom, g_logOpenT);
     const bool show = L.logBody.Height > S(30);
     const int x = static_cast<int>(L.logBody.X + S(6)), y = static_cast<int>(L.logBody.Y),
@@ -1294,6 +1473,7 @@ void MakeFonts() {
                              CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, FIXED_PITCH, mono.c_str());
     if (g_editHub) SendMessageW(g_editHub, WM_SETFONT, reinterpret_cast<WPARAM>(g_editFont), TRUE);
     if (g_editModule) SendMessageW(g_editModule, WM_SETFONT, reinterpret_cast<WPARAM>(g_editFont), TRUE);
+    if (g_editKey) SendMessageW(g_editKey, WM_SETFONT, reinterpret_cast<WPARAM>(g_editFont), TRUE);
 }
 
 // ---------------------------------------------------------------- background (cached per window size)
@@ -1475,6 +1655,23 @@ void DrawSidebar(Gdiplus::Graphics& g, const Lay& L) {
 
     // Bottom panel: auto-inject, language, version and update.
     const float pw = L.sidebar.Width - S(24);
+    {  // account: who owns the key, how long it lasts, account page and sign-out
+        const RectF acc(S(12), L.sidebar.Height - S(196) - S(12) - S(112), pw, S(112));
+        Fill(g, acc, S(16), th::card, 0.9f * intro);
+        Stroke(g, acc, S(16), th::line, intro);
+        const RectF av(acc.X + S(14), acc.Y + S(14), S(36), S(36));
+        Fill(g, av, S(18), th::card2, intro);
+        Stroke(g, av, S(18), th::lineHi, intro);
+        const std::wstring who = g_licUser.empty() ? std::wstring(Tr(L"Account", L"Аккаунт")) : g_licUser;
+        Text(g, who.substr(0, 1), *g_fBodyBold, av, th::accent, intro, Gdiplus::StringAlignmentCenter);
+        Text(g, who, *g_fBodyBold, RectF(av.X + S(46), acc.Y + S(12), pw - S(76), S(22)), th::text, intro);
+        const bool soon = g_licExpiresMs > 0 && g_licExpiresMs / 1000 - UnixNow() < 3 * 86400;
+        FillDot(g, av.X + S(50), acc.Y + S(43), S(3.5f), soon ? th::warn : th::ok, A(intro));
+        Text(g, LicenseLeftText(), *g_fSmall, RectF(av.X + S(60), acc.Y + S(33), pw - S(90), S(20)), th::dim, intro);
+        const float bw = (pw - S(28) - S(8)) / 2;
+        Button(g, RectF(acc.X + S(14), acc.Y + S(64), bw, S(34)), Tr(L"Account", L"Кабинет"), BtnKind::Secondary, true, Act::LicenseAccount, 0, intro);
+        Button(g, RectF(acc.X + S(14) + bw + S(8), acc.Y + S(64), bw, S(34)), Tr(L"Sign out", L"Выйти"), BtnKind::Ghost, !g_demo, Act::LicenseSignOut, 0, intro);
+    }
     const RectF panel(S(12), L.sidebar.Height - S(196), pw, S(182));
     Fill(g, panel, S(16), th::card, 0.9f * intro);
     Stroke(g, panel, S(16), th::line, intro);
@@ -1718,6 +1915,8 @@ void DrawLog(Gdiplus::Graphics& g, const Lay& L) {
     }
 }
 
+void DrawLicenseGate(Gdiplus::Graphics& g, int w, int h);
+
 void Render(Gdiplus::Graphics& g, int w, int h) {
     g_now = NowSec();
     if (g_appStart == 0) g_appStart = g_now;
@@ -1737,6 +1936,11 @@ void Render(Gdiplus::Graphics& g, int w, int h) {
         g_logOpenT = openT;
         PositionLogs();
     }
+    if (g_lic != Lic::Ok) {
+        DrawLicenseGate(g, w, h);
+        DrawCaptionButtons(g, static_cast<float>(w));
+        return;
+    }
     const Lay L = Compute(w, h, g_logOpenT);
     DrawSidebar(g, L);
 
@@ -1750,6 +1954,36 @@ void Render(Gdiplus::Graphics& g, int w, int h) {
     DrawLive(g, lift(L.live, a3), a3);
     DrawLog(g, L);
     DrawCaptionButtons(g, static_cast<float>(w));
+}
+
+void DrawLicenseGate(Gdiplus::Graphics& g, int w, int h) {
+    const float a = EaseOutCubic(Progress(g_pageStart, 0.4));
+    const float cw = S(480), ch = S(330);
+    RectF c((w - cw) / 2, (h - ch) / 2 + S(14) * (1 - a), cw, ch);
+    Card(g, c, a);
+    const RectF mark(c.X + S(40), c.Y + S(36), S(40), S(40));
+    Fill(g, mark, S(11), th::card2, a);
+    Stroke(g, mark, S(11), th::lineHi, a);
+    Text(g, L"A", *g_fTitle, mark, th::text, a, Gdiplus::StringAlignmentCenter);
+    Fill(g, RectF(mark.X + S(29), mark.Y + S(29), S(6), S(6)), S(3), th::accent, a);
+    Text(g, Tr(L"Activate AeroHub", L"Активация AeroHub"), *g_fTitle, RectF(c.X + S(96), c.Y + S(34), cw - S(130), S(30)), th::text, a);
+    Text(g, Tr(L"Enter the key from your account on the site", L"Введите ключ из личного кабинета на сайте"), *g_fSmall,
+         RectF(c.X + S(96), c.Y + S(62), cw - S(130), S(20)), th::dim, a);
+    if (g_lic == Lic::Checking) {
+        Text(g, Tr(L"Checking the key…", L"Проверяем ключ…"), *g_fBody, RectF(c.X + S(40), c.Y + S(140), cw - S(80), S(40)), th::dim, a);
+        return;
+    }
+    Text(g, Tr(L"Licence key", L"Ключ"), *g_fSmallBold, RectF(c.X + S(40), c.Y + S(112), cw - S(80), S(20)), th::dim, a);
+    const RectF field(c.X + S(28), c.Y + S(138), cw - S(56), S(48));
+    Fill(g, field, S(12), th::logBg, a);
+    Stroke(g, field, S(12), GetFocus() == g_editKey ? th::accent : th::lineHi, a);
+    if (!g_licMsg.empty())
+        Text(g, g_licMsg, *g_fSmall, RectF(c.X + S(40), c.Y + S(192), cw - S(80), S(36)), th::bad, a, Gdiplus::StringAlignmentNear,
+             Gdiplus::StringAlignmentNear, true);
+    const float bw = (cw - S(56) - S(12)) / 2, by = c.Y + ch - S(28) - S(46);
+    Button(g, RectF(c.X + S(28), by, bw, S(46)), g_licBusy ? Tr(L"Checking…", L"Проверка…") : Tr(L"Activate", L"Активировать"), BtnKind::Primary,
+           !g_licBusy, Act::LicenseActivate, 0, a);
+    Button(g, RectF(c.X + S(28) + bw + S(12), by, bw, S(46)), Tr(L"Open the site", L"Открыть сайт"), BtnKind::Secondary, true, Act::LicenseSite, 0, a);
 }
 
 void Paint(HDC dc, int w, int h) {
@@ -1822,7 +2056,15 @@ void SetLanguage(int lang) {
 }
 
 void Perform(Act act, int idx) {
+    if (g_lic != Lic::Ok && act != Act::WinMin && act != Act::WinMax && act != Act::WinClose && act != Act::LicenseActivate && act != Act::LicenseSite)
+        return;
     switch (act) {
+        case Act::LicenseActivate: ActivateFromEdit(); break;
+        case Act::LicenseSite: ShellExecuteW(nullptr, L"open", aero::license::kSiteUrl, nullptr, nullptr, SW_SHOWNORMAL); break;
+        case Act::LicenseAccount:
+            ShellExecuteW(nullptr, L"open", (std::wstring(aero::license::kSiteUrl) + L"/account").c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            break;
+        case Act::LicenseSignOut: SignOut(); break;
         case Act::SelectGame:
             if (idx != g_sel) {
                 g_sel = idx;
@@ -1900,6 +2142,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SendMessageW(e, EM_SETLIMITTEXT, 1 << 20, 0);
                 SetWindowTheme(e, L"DarkMode_Explorer", nullptr);
             }
+            g_editKey = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_TABSTOP | ES_AUTOHSCROLL | ES_UPPERCASE, 0, 0, 0, 0, hwnd,
+                                        reinterpret_cast<HMENU>(kEditKey), nullptr, nullptr);
+            SendMessageW(g_editKey, EM_SETLIMITTEXT, 40, 0);
+            SendMessageW(g_editKey, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"AERO-XXXX-XXXX-XXXX-XXXX"));
             MakeFonts();
 
             g_autoInject = GetPrivateProfileIntW(L"Hub", L"AutoInject", 0, g_settingsFile.c_str()) != 0;
@@ -1934,6 +2180,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_checkUpdates = GetPrivateProfileIntW(L"Hub", L"CheckUpdates", 1, g_settingsFile.c_str()) != 0;
             Log(std::wstring(L"AeroHub v") + aero::kAppVersion);
             if (g_checkUpdates) StartVersionCheck();
+            {
+                wchar_t key[96]{};
+                GetPrivateProfileStringW(L"License", L"Key", L"", key, static_cast<DWORD>(std::size(key)), g_settingsFile.c_str());
+                g_licKey = aero::license::NormalizeKey(key);
+                GetPrivateProfileStringW(L"License", L"User", L"", key, static_cast<DWORD>(std::size(key)), g_settingsFile.c_str());
+                g_licUser = key;
+                GetPrivateProfileStringW(L"License", L"Expires", L"0", key, static_cast<DWORD>(std::size(key)), g_settingsFile.c_str());
+                g_licExpiresMs = _wtoi64(key);
+                GetPrivateProfileStringW(L"License", L"Games", L"", key, static_cast<DWORD>(std::size(key)), g_settingsFile.c_str());
+                g_licGames = key;
+                g_allProfiles = g_profiles;
+                ApplyLicensedGames();
+                Refresh();
+                if (g_demo) g_lic = Lic::Ok;
+                else if (g_licKey.empty()) g_lic = Lic::Need;
+                else StartLicenseCheck(g_licKey);
+                SetWindowTextW(g_editKey, g_licKey.c_str());
+                PositionLogs();
+            }
             SetTimer(hwnd, kTimer, 1000, nullptr);
             return 0;
         }
@@ -1997,6 +2262,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 Redraw();
                 return 0;
             }
+            if (g_lic != Lic::Ok) return 0;
+            if (!g_demo && !g_licBusy && NowSec() - g_licLastCheck > kLicenseRecheckSec) StartLicenseCheck(g_licKey);
             PollWaiting();
             PollSlimeRancher();
             Refresh();
@@ -2004,6 +2271,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             PollModuleLog();
             return 0;
         case kMsgUpdate: OnUpdateMessage(wp, lp); return 0;
+        case kMsgLicense: OnLicenseMessage(); return 0;
+        case WM_COMMAND:
+            if (LOWORD(wp) == kEditKey && (HIWORD(wp) == EN_SETFOCUS || HIWORD(wp) == EN_KILLFOCUS)) Redraw();
+            break;
         case WM_ERASEBKGND: return 1;
         case WM_PAINT: {
             PAINTSTRUCT ps;
@@ -2017,7 +2288,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORSTATIC: {
             HDC dc = reinterpret_cast<HDC>(wp);
-            SetTextColor(dc, RGB(196, 198, 204));
+            SetTextColor(dc, reinterpret_cast<HWND>(lp) == g_editKey ? th::text : RGB(196, 198, 204));
             SetBkColor(dc, th::logBg);
             return reinterpret_cast<LRESULT>(g_surfaceBrush);
         }

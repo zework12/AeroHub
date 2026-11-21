@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 // Small GDI+ rendered HUD pieces (enemy labels, enemy-base radar), painted in the shared AeroHub look and
 // uploaded by the overlay as textures.
 #include <windows.h>
@@ -31,7 +31,11 @@ struct ViewDevice {
 
 // "Observer" window: the whole base drawn from above (beams as lines coloured by health, devices as
 // markers), zoomed out automatically so a bigger base is always fully visible.
-void RenderBaseView(const std::vector<ViewSegment>& segments, const std::vector<ViewDevice>& devices, float scale, HudImage& out);
+// baseIndex / baseCount: which enemy base is shown; with more than one, arrows in the header switch (see BaseViewArrow).
+void RenderBaseView(const std::vector<ViewSegment>& segments, const std::vector<ViewDevice>& devices, float scale, HudImage& out,
+                    int baseIndex = 0, int baseCount = 1);
+// Hit test for those arrows, in the panel's own pixels: -1 left, +1 right, 0 none.
+int BaseViewArrow(float x, float y, float scale);
 
 // Compact key / value panel (used for the spy-style enemy intel).
 struct PanelLine {

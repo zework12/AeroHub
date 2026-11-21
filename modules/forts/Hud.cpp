@@ -1,4 +1,4 @@
-﻿#include "Hud.hpp"
+#include "Hud.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -36,7 +36,16 @@ void RenderLabel(const std::wstring& text, COLORREF accent, float scale, HudImag
     DrawStr(g, text, font, r, kText, Gdiplus::StringAlignmentCenter);
 }
 
-void RenderBaseView(const std::vector<ViewSegment>& segments, const std::vector<ViewDevice>& devices, float scale, HudImage& out) {
+int BaseViewArrow(float x, float y, float scale) {
+    const float s = scale;
+    if (y < 4 * s || y > 32 * s) return 0;
+    if (x >= 84 * s && x < 110 * s) return -1;
+    if (x >= 196 * s && x < 222 * s) return 1;
+    return 0;
+}
+
+void RenderBaseView(const std::vector<ViewSegment>& segments, const std::vector<ViewDevice>& devices, float scale, HudImage& out,
+                    int baseIndex, int baseCount) {
     const float s = scale;
     out.w = static_cast<int>(480 * s + 0.5f);
     out.h = static_cast<int>(350 * s + 0.5f);
@@ -56,7 +65,17 @@ void RenderBaseView(const std::vector<ViewSegment>& segments, const std::vector<
     int guns = 0;
     for (const ViewDevice& d : devices) guns += d.kind == 1 ? 1 : 0;
     DrawStr(g, L"Observer", fH2, RectF(14 * s, 8 * s, 120 * s, 24 * s), kText);
-    DrawStr(g, L"enemy base", fSmall, RectF(88 * s, 9 * s, 120 * s, 24 * s), kDim);
+    if (baseCount > 1) {
+        FillRR(g, RectF(86 * s, 7 * s, 22 * s, 22 * s), 6 * s, kBorder);
+        FillRR(g, RectF(198 * s, 7 * s, 22 * s, 22 * s), 6 * s, kBorder);
+        DrawStr(g, L"<", fH2, RectF(86 * s, 7 * s, 22 * s, 22 * s), kText, Gdiplus::StringAlignmentCenter);
+        DrawStr(g, L">", fH2, RectF(198 * s, 7 * s, 22 * s, 22 * s), kText, Gdiplus::StringAlignmentCenter);
+        wchar_t b[48];
+        swprintf_s(b, L"enemy %d / %d", baseIndex + 1, baseCount);
+        DrawStr(g, b, fSmall, RectF(108 * s, 9 * s, 90 * s, 24 * s), kDim, Gdiplus::StringAlignmentCenter);
+    } else {
+        DrawStr(g, L"enemy base", fSmall, RectF(88 * s, 9 * s, 120 * s, 24 * s), kDim);
+    }
     const float liveW = DrawPill(g, s, fSmall, out.w - 14 * s - 70 * s, 7 * s, L"LIVE", kBad);
     (void)liveW;
 

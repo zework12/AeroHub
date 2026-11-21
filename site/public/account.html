@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Кабинет · AeroHub</title>
+<link rel="icon" href="img/icon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="ambient" aria-hidden="true"></div>
+<header class="top"><div class="wrap">
+  <a class="brand" href="/"><span class="mark">A</span>AeroHub</a>
+  <nav class="links"><a id="admin-link" href="/admin" hidden>Админка</a><a href="#" id="logout">Выйти</a></nav>
+</div></header>
+<div class="page"><div class="wrap stack">
+  <div><h1 style="margin:0">Личный кабинет</h1><p class="sub" style="color:var(--dim);margin:4px 0 0" id="hello"></p></div>
+
+  <div class="card">
+    <h3>Мои игры</h3>
+    <div id="mygames" class="gamechips"></div>
+  </div>
+
+  <div class="card">
+    <h3>Скачать AeroHub</h3>
+    <p id="dl-note">Скачивание доступно с активным ключом.</p>
+    <div style="margin-top:14px"><a class="btn primary" id="dl" href="/download">Скачать установщик</a></div>
+  </div>
+
+  <div class="card">
+    <h3>Активировать ключ</h3>
+    <form id="redeem" class="row" style="margin-top:6px">
+      <div><label for="k">Ключ</label><input id="k" name="key" placeholder="AERO-XXXX-XXXX-XXXX-XXXX" required></div>
+      <button class="btn primary" type="submit">Активировать</button>
+      <div class="msg" style="flex-basis:100%"></div>
+    </form>
+  </div>
+
+  <div class="card">
+    <h3>Мои ключи</h3>
+    <div class="tablebox"><table>
+      <thead><tr><th>Ключ</th><th>Игры</th><th>Статус</th><th>Активирован</th><th>До</th><th>Компьютер</th><th></th></tr></thead>
+      <tbody id="keys"></tbody>
+    </table></div>
+  </div>
+</div></div>
+<script src="app.js"></script>
+<script>
+async function load() {
+  const me = await api('/api/me');
+  if (!me.ok) return (location.href = '/login');
+  const d = me.data;
+  document.getElementById('hello').textContent = `Аккаунт: ${d.username}`;
+  document.getElementById('admin-link').hidden = !d.admin;
+  const active = d.keys.some(k => k.status === 'active');
+  const dl = document.getElementById('dl');
+  dl.toggleAttribute('hidden', !active || !d.download);
+  document.getElementById('dl-note').textContent = !active ? 'Скачивание доступно с активным ключом.'
+    : d.download ? 'Последняя версия установщика.' : 'Установщик ещё не загружен на сервер.';
+  document.getElementById('mygames').replaceChildren(...d.games.map(g => el('div', { class: 'gamechip' + (g.free ? ' free' : '') },
+    el('b', {}, g.name), el('span', {}, g.free ? 'в подарок' : (g.expires ? 'до ' + fmtDate(g.expires) : 'навсегда')))));
+  const body = document.getElementById('keys');
+  body.replaceChildren();
+  if (!d.keys.length) body.append(el('tr', {}, el('td', { colspan: 7, class: 'empty' }, 'Ключей пока нет — активируйте ключ выше')));
+  for (const k of d.keys) {
+    const reset = el('button', { class: 'btn small', onclick: async () => {
+      const r = await api('/api/reset-hwid', { key: k.key });
+      if (r.ok) load();
+    } }, 'Сбросить ПК');
+    if (!k.hwidBound) reset.disabled = true;
+    body.append(el('tr', {},
+      el('td', { style: 'white-space:nowrap' }, el('code', {}, k.key), ' ', copyButton(k.key)),
+      el('td', {}, (k.games || []).join(', ')),
+      el('td', {}, el('span', { class: `pill ${k.status}` }, STATUS_RU[k.status] || k.status)),
+      el('td', {}, fmtDate(k.redeemed)),
+      el('td', {}, k.expires ? fmtDate(k.expires) : 'навсегда'),
+      el('td', {}, k.hwidBound ? 'привязан' : 'не привязан'),
+      el('td', {}, reset)));
+  }
+}
+bindForm(document.getElementById('redeem'), async (v) => {
+  const r = await api('/api/redeem', v);
+  if (!r.ok) throw new Error(r.data.error || 'Не удалось активировать');
+  document.getElementById('k').value = '';
+  load();
+  return 'Ключ активирован';
+});
+document.getElementById('logout').addEventListener('click', async (e) => {
+  e.preventDefault();
+  await api('/api/logout', {});
+  location.href = '/';
+});
+load();
+</script>
+</body>
+</html>

@@ -24,7 +24,8 @@ add_library(AeroCore STATIC
   core/Diagnostics.cpp
   core/IatHook.cpp
   core/Ipc.cpp
-  core/Update.cpp)
+  core/Update.cpp
+    core/License.cpp)
 target_include_directories(AeroCore PUBLIC core)
 
 # The application: lists game profiles, validates the running build, injects the module.

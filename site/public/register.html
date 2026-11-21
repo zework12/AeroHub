@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Регистрация · AeroHub</title>
+<link rel="icon" href="img/icon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="ambient" aria-hidden="true"></div>
+<header class="top"><div class="wrap"><a class="brand" href="/"><span class="mark">A</span>AeroHub</a></div></header>
+<div class="page"><div class="wrap"><div class="auth">
+  <h1>Регистрация</h1>
+  <p class="sub">Уже есть аккаунт? <a href="/login">Войти</a></p>
+  <form id="f">
+    <label for="u">Логин</label><input id="u" name="username" autocomplete="username" required minlength="3" maxlength="24">
+    <label for="p">Пароль</label><input id="p" name="password" type="password" autocomplete="new-password" required minlength="8">
+    <label for="p2">Пароль ещё раз</label><input id="p2" name="password2" type="password" autocomplete="new-password" required>
+    <button class="btn primary" type="submit">Создать аккаунт</button>
+    <div class="msg"></div>
+  </form>
+</div></div></div>
+<script src="app.js"></script>
+<script>
+bindForm(document.getElementById('f'), async (v) => {
+  if (v.password !== v.password2) throw new Error('Пароли не совпадают');
+  const r = await api('/api/register', { username: v.username, password: v.password });
+  if (!r.ok) throw new Error(r.data.error || 'Ошибка регистрации');
+  location.href = '/account';
+});
+</script>
+</body>
+</html>

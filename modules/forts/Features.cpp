@@ -66,9 +66,9 @@ constexpr const char* kItemNames[kItemCount] = {
     "Unlimited resources", "Fast build: beams", "Fast build: tech and guns", "Minigun (fast reload)", "Commander auto-refill",
     "Auto-repair", "Repair speed", "Repair what", "Trajectory overlay", "Impact markers", "Incoming shells warning",
     "Aim calculator (needs a target)", "Auto-aim at target", "Enemy overlay", "Enemy base window (observer)", "Enemy intel (spy panel)",
-    "Enemy gun timers", "Weak links: enemy base", "Weak links: your base", "Battle stats panel", "Record shots to log",
+    "Enemy gun timers", "Weak links (both bases)", "Weak links: your base", "Battle stats panel", "Record shots to log",
     "Write diagnostics to log", "All off", "Pick target under cursor",
-    "Battery: on", "Battery: target + fire"};
+    "Salvo: collect guns", "Salvo: fire at the mouse"};
 constexpr aero::ipc::Kind kItemKinds[kItemCount] = {
     aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle, aero::ipc::kToggle,
     aero::ipc::kButton, aero::ipc::kButton,  // repair speed / repair what (choice rows)
@@ -96,10 +96,10 @@ constexpr const wchar_t* kItemNamesRu[kItemCount] = {
     L"Бесконечные ресурсы", L"Быстрая постройка: балки", L"Быстрая постройка: техи и орудия", L"Миниган (быстрая перезарядка)",
     L"Автозаряд командира", L"Авторемонт", L"Скорость ремонта", L"Что ремонтировать", L"Траектория выстрела", L"Метки попадания",
     L"Предупреждение о снарядах", L"Расчёт прицела (нужна цель)", L"Автонаведение на цель", L"Оверлей врага",
-    L"Окно базы врага (наблюдатель)", L"Разведка врага (панель шпиона)", L"Таймеры орудий врага", L"Слабые звенья: база врага",
+    L"Окно базы врага (наблюдатель)", L"Разведка врага (панель шпиона)", L"Таймеры орудий врага", L"Слабые звенья (обе базы)",
     L"Слабые звенья: моя база", L"Панель статистики боя", L"Запись выстрелов в лог", L"Записать диагностику в лог", L"Выключить всё",
     L"Выбрать цель под курсором",
-    L"Батарея: включить", L"Батарея: цель и огонь"};
+    L"Собирать орудия в залп", L"Залп в точку под мышью"};
 constexpr const wchar_t* kItemDescEn[kItemCount] = {
     L"Metal and energy never run out",
     L"Struts build instantly (offline only)",
@@ -109,24 +109,24 @@ constexpr const wchar_t* kItemDescEn[kItemCount] = {
     L"Repairs damaged devices and beams over time",
     L"How fast auto-repair works (click to change)",
     L"What auto-repair fixes (click to change)",
-    L"Draws the flight arc of your guns' shells",
+    L"Flight arc of your guns' shells, landing rings and flight time",
     L"Rings where shells land, with flight time",
     L"Warns about enemy shells heading for your base",
     L"Angle to hit the target with your selected gun",
     L"Turns your guns onto the target (offline only)",
-    L"Type, health and reload over enemy devices",
+    L"Type, health and a reload bar over enemy devices and guns",
     L"Window with the enemy base (observer)",
     L"Spy panel with information about the enemy",
     L"Reload bar on every enemy gun",
-    L"Beams whose loss would split the enemy base",
+    L"Beams whose loss would split the enemy base or yours",
     L"Beams whose loss would split your base",
     L"Shots, hits and damage (estimates)",
     L"Writes shot data to the log for calibration",
     L"Writes a state report to the log once",
     L"Switches every feature off",
     L"Target = the enemy device nearest to the mouse",
-    L"Every gun you select in the game joins one group, no limit of 3. Off = the group is emptied (offline only)",
-    L"Target = the point under the mouse: the whole group aims there and fires a salvo (offline only)"};
+    L"Click your guns in the game one by one: each joins the salvo. Off = the list is cleared",
+    L"Every collected gun fires at the point under the mouse at once"};
 constexpr const wchar_t* kItemDescRu[kItemCount] = {
     L"Металл и энергия не заканчиваются",
     L"Балки строятся мгновенно (только офлайн)",
@@ -136,24 +136,24 @@ constexpr const wchar_t* kItemDescRu[kItemCount] = {
     L"Со временем чинит устройства и балки",
     L"Скорость авторемонта (клик — сменить)",
     L"Что чинит авторемонт (клик — сменить)",
-    L"Рисует дугу полёта снарядов ваших орудий",
+    L"Дуга полёта снарядов, точки падения и время полёта",
     L"Кольца точек падения и время полёта",
     L"Предупреждает о снарядах, летящих в вашу базу",
     L"Угол для попадания из выбранного орудия",
     L"Наводит орудия на цель (только офлайн)",
-    L"Тип, здоровье и перезарядка врага",
+    L"Тип, здоровье и полоса перезарядки врага",
     L"Окно с базой врага (для наблюдателя)",
     L"Панель шпиона со сведениями о враге",
     L"Полоса перезарядки на орудиях врага",
-    L"Балки, без которых база врага развалится",
+    L"Балки, без которых база врага или ваша развалится",
     L"Балки, без которых ваша база развалится",
     L"Выстрелы, попадания и урон (оценка)",
     L"Пишет данные выстрелов в лог для калибровки",
     L"Один раз пишет отчёт о состоянии в лог",
     L"Выключает все функции",
     L"Цель — вражеское устройство ближе всего к мыши",
-    L"Каждое орудие, выбранное в игре, входит в одну группу, без лимита в 3. Выкл = группа очищается (только офлайн)",
-    L"Цель = точка под мышью: вся группа наводится туда и даёт залп (только офлайн)"};
+    L"Щёлкайте свои орудия в игре по одному — каждое добавляется в залп. Выкл = список очищается",
+    L"Все собранные орудия разом стреляют в точку под мышью"};
 constexpr const wchar_t* kRepairSpeedRu[4] = {L"Медл. 8%/с", L"Сред. 25%/с", L"Быстр. 60%/с", L"Мгновенно"};
 constexpr const wchar_t* kRepairWhatRu[3] = {L"Всё", L"Устройства", L"Балки"};
 constexpr const wchar_t* kTabNamesRu[kTabCount] = {L"Общее", L"Бой", L"Враг", L"Инструменты", L"Настройки"};
@@ -199,6 +199,11 @@ std::wstring BindLabel(int item) {
 }
 
 // Caption shown above an item (starts a group of related rows); nullptr = no caption.
+// Items folded into another one: their state follows the parent item, they have no row of their own.
+bool MergedItem(int item) { return item == kItemImpact || item == kItemTimers || item == kItemWeakOwn || item == kItemAimCalc || item == kItemAutoAim ||
+                                    item == kItemPickTarget;  // aiming: replaced by the salvo
+}
+
 const wchar_t* SectionBefore(int item) {
     switch (item) {
         case kItemUnlimited: return Tr(L"RESOURCES AND SPEED", L"РЕСУРСЫ И СКОРОСТЬ");
@@ -206,7 +211,7 @@ const wchar_t* SectionBefore(int item) {
         case kItemTrajectory: return Tr(L"MY SHOTS", L"МОИ ВЫСТРЕЛЫ");
         case kItemThreats: return Tr(L"DEFENCE", L"ЗАЩИТА");
         case kItemAimCalc: return Tr(L"AIMING", L"НАВЕДЕНИЕ");
-        case kItemBattery: return Tr(L"BATTERY (ANY NUMBER OF GUNS, ONE PLACE)", L"БАТАРЕЯ (ЛЮБОЕ ЧИСЛО ОРУДИЙ, ОДНО МЕСТО)");
+        case kItemBattery: return Tr(L"SALVO FROM MANY GUNS", L"ЗАЛП ИЗ МНОГИХ ОРУДИЙ");
         case kItemEnemyOverlay: return Tr(L"ENEMY INFORMATION", L"ИНФОРМАЦИЯ О ВРАГЕ");
         case kItemWeakEnemy: return Tr(L"WEAK LINKS", L"СЛАБЫЕ ЗВЕНЬЯ");
         case kItemStats: return Tr(L"STATISTICS", L"СТАТИСТИКА");
@@ -317,6 +322,7 @@ struct EnemyDev {
     Vec3 pos;
     bool weapon = false;
     std::string type;
+    int teamCode = 0;
     bool timerOk = false;   // the fields below were read this refresh
     bool ready = false;     // IsWeaponReadyToFire
     float reloadValue = 0;  // GetWeaponReloadTime as reported
@@ -332,6 +338,7 @@ struct OwnDev {
 };
 std::vector<OwnDev> g_own;
 std::vector<int> g_enemyCodes;
+int g_viewBase = 0;  // which of g_enemyCodes the observer window shows (arrows in its header)
 std::map<int, std::string> g_typeById;  // device id -> type name (a device never changes type)
 bool g_worldFresh = false;              // set by every RefreshWorld pass, consumed by the damage statistics
 
@@ -537,7 +544,10 @@ bool PanelPointer(float px, float py, bool down, bool menuTakes) {
         }
     } else if (!hit.empty()) {
         PanelSpot& s = g_spots[hit];
-        if (down && !wasDown) {
+        const int arrow = hit == "radar" && g_enemyCodes.size() > 1 ? BaseViewArrow(px - s.curX, py - s.curY, g_uiScale) : 0;
+        if (down && !wasDown && arrow != 0) {
+            g_viewBase += arrow;  // wrapped into range on the next refresh
+        } else if (down && !wasDown) {
             g_dragSpot = hit;
             g_dragGrabX = px - s.curX;
             g_dragGrabY = py - s.curY;
@@ -702,10 +712,12 @@ void SetRepair(bool on) {
 
 void SetTrajectory(bool on) {
     g_state.trajectory = on;
+    g_state.impact = on;  // landing rings are part of the trajectory item
     Logf("trajectory overlay: %d", on ? 1 : 0);
 }
 
 void SetImpact(bool on) {
+    if (on && !g_state.trajectory) SetTrajectory(true);  // the markers sit on the trajectory lines
     g_state.impact = on;
     Logf("impact markers: %d", on ? 1 : 0);
 }
@@ -728,6 +740,7 @@ void SetBattery(bool on) {
 
 void SetEnemyOverlay(bool on) {
     g_state.enemyOverlay = on;
+    g_state.timers = on;  // reload bars are part of the enemy overlay item
     Logf("enemy overlay: %d", on ? 1 : 0);
 }
 
@@ -757,12 +770,14 @@ void SetAimCalc(bool on) {
 }
 
 void SetTimers(bool on) {
+    if (on && !g_state.enemyOverlay) SetEnemyOverlay(true);  // the timer bars are drawn on the enemy boxes
     g_state.timers = on;
     Logf("enemy gun timers: %d", on ? 1 : 0);
 }
 
 void SetWeakEnemy(bool on) {
     g_state.weakEnemy = on;
+    g_state.weakOwn = on;  // one item for both bases
     Logf("weak links (enemy base): %d", on ? 1 : 0);
 }
 
@@ -1345,11 +1360,13 @@ void RefreshWorld(int team, bool wantRadar) {
         weaponsByCode[d.teamCode] = std::set<int>(weapons.begin(), weapons.end());
     }
     static bool logged = false;
+    const int ownSide = ((team % 100) + 100) % 100;
     for (const RawDevice& d : raw) {
         if (d.state == 5 || deviceCount >= 1500) continue;
         const bool own = d.teamCode == team;
         const int side = ((d.teamCode % 100) + 100) % 100;
         if (!own && side != 1 && side != 2) continue;  // neutral / map devices
+        if (!own && side == ownSide) continue;          // a teammate: same side, another player
         Vec3 p;
         if (!g_api.DevicePosition(d.id, p)) continue;
         const bool isWeapon = weaponsByCode[d.teamCode].count(d.id) != 0;
@@ -1357,6 +1374,7 @@ void RefreshWorld(int team, bool wantRadar) {
         e.id = d.id;
         e.pos = p;
         e.weapon = isWeapon;
+        e.teamCode = d.teamCode;
         if (!own) g_api.DeviceTypeName(d.id, e.type);
         ++deviceCount;
         if (own) {
@@ -1378,7 +1396,7 @@ void RefreshWorld(int team, bool wantRadar) {
         std::map<int, int> perCode;
         for (const RawDevice& d : raw) {
             const int side = ((d.teamCode % 100) + 100) % 100;
-            if (d.state != 5 && d.teamCode != team && (side == 1 || side == 2)) ++perCode[d.teamCode];
+            if (d.state != 5 && d.teamCode != team && (side == 1 || side == 2) && side != ownSide) ++perCode[d.teamCode];
         }
         g_enemyTeam = 0;
         int best = 0;
@@ -1469,19 +1487,23 @@ void RefreshWorld(int team, bool wantRadar) {
         g_state.aimTarget = 0;  // target destroyed
         Logf("auto-aim: target gone");
     }
-    if (wantRadar && g_enemyTeam != 0) {
+    if (wantRadar && !g_enemyCodes.empty()) {
+        const int baseCount = static_cast<int>(g_enemyCodes.size());
+        g_viewBase = ((g_viewBase % baseCount) + baseCount) % baseCount;
+        const int viewCode = g_enemyCodes[static_cast<std::size_t>(g_viewBase)];
         std::vector<ViewSegment> segments;
         std::vector<BaseSegment> beams;
-        if (g_api.BaseSegments(g_enemyTeam, beams))
+        if (g_api.BaseSegments(viewCode, beams))
             for (const BaseSegment& s : beams) segments.push_back({s.x1, s.y1, s.x2, s.y2, s.health, s.building});
         std::vector<ViewDevice> devices;
-        for (const EnemyDev& e : g_enemy) devices.push_back({e.pos.x, e.pos.y, e.type == "reactor" ? 2 : (e.weapon ? 1 : 0), e.type});
+        for (const EnemyDev& e : g_enemy)
+            if (e.teamCode == viewCode) devices.push_back({e.pos.x, e.pos.y, e.type == "reactor" ? 2 : (e.weapon ? 1 : 0), e.type});
         static bool loggedView = false;
         if (!loggedView) {
             loggedView = true;
-            Logf("observer view: %zu beam(s) and %zu device(s) of team code %d", segments.size(), devices.size(), g_enemyTeam);
+            Logf("observer view: %zu beam(s) and %zu device(s) of team code %d", segments.size(), devices.size(), viewCode);
         }
-        RenderBaseView(segments, devices, g_uiScale, g_radarImage);
+        RenderBaseView(segments, devices, g_uiScale, g_radarImage, g_viewBase, baseCount);
         g_radarFresh = true;
     }
 }
@@ -2843,10 +2865,12 @@ void ActivateItem(int item) {
         case kItemRepair: SetRepair(!g_state.repair); break;
         case kItemRepairSpeed:
             g_state.repairLevel = (g_state.repairLevel + 1) % 4;
+            if (!g_state.repair) SetRepair(true);  // choosing how to repair means repairing
             Logf("repair speed: %ls", kRepairSpeedNames[g_state.repairLevel]);
             break;
         case kItemRepairWhat:
             g_state.repairWhat = (g_state.repairWhat + 1) % 3;
+            if (!g_state.repair) SetRepair(true);  // choosing how to repair means repairing
             Logf("repair what: %ls", kRepairWhatNames[g_state.repairWhat]);
             break;
         case kItemTrajectory: SetTrajectory(!g_state.trajectory); break;
@@ -2940,7 +2964,7 @@ void BuildRows(std::vector<MenuRow>& rows) {
         return;
     }
     for (int i = 0; i < kItemCount; ++i) {
-        if (kItemTab[i] != g_state.menuTab) continue;
+        if (kItemTab[i] != g_state.menuTab || MergedItem(i)) continue;
         if (const wchar_t* caption = SectionBefore(i)) {
             MenuRow section;
             section.name = caption;
@@ -2996,29 +3020,6 @@ void BuildRows(std::vector<MenuRow>& rows) {
             r.on = ShowType(name);
             r.id = kRowIdType + static_cast<int>(g_typeList.size());
             g_typeList.push_back(name);
-            rows.push_back(std::move(r));
-        }
-    }
-    if (g_state.menuTab == 2) {
-        MenuRow section;
-        section.name = g_targets.empty() ? Tr(L"AUTO-AIM TARGET (NO ENEMY GUNS SEEN YET)", L"ЦЕЛЬ АВТОНАВЕДЕНИЯ (ВРАЖЕСКИХ ОРУДИЙ ЕЩЁ НЕТ)")
-                                         : Tr(L"AUTO-AIM TARGET (NEAREST TO CAMERA)", L"ЦЕЛЬ АВТОНАВЕДЕНИЯ (БЛИЖАЙШИЕ К КАМЕРЕ)");
-        section.section = true;
-        rows.push_back(std::move(section));
-        Vec3 cam;
-        const bool hasCam = g_api.CameraFocus(cam);
-        for (std::size_t i = 0; i < g_targets.size(); ++i) {
-            const EnemyDev* e = FindEnemy(g_targets[i]);
-            if (!e) continue;
-            MenuRow r;
-            wchar_t dist[32] = L"";
-            if (hasCam) {
-                const float dx = e->pos.x - cam.x, dy = e->pos.y - cam.y;
-                swprintf_s(dist, L"  %.1fk", std::sqrt(dx * dx + dy * dy) / 1000.0f);
-            }
-            r.name = Widen(e->type.empty() ? "gun" : e->type) + L" #" + std::to_wstring(e->id) + dist;
-            r.on = g_state.aimTarget == e->id;
-            r.id = kRowIdTarget + static_cast<int>(i);
             rows.push_back(std::move(r));
         }
     }
@@ -3449,7 +3450,7 @@ bool InstallFeatures(std::string& error) {
 
     // Hook is live; only now expose the hub control channel.
     if (g_ipc.Create()) {
-        for (int i = 0; i < kItemCount; ++i) g_featureId[i] = g_ipc.AddFeature(kItemNames[i], kItemKinds[i]);
+        for (int i = 0; i < kItemCount; ++i) g_featureId[i] = MergedItem(i) ? -1 : g_ipc.AddFeature(kItemNames[i], kItemKinds[i]);
     } else {
         Logf("hub control channel unavailable (in-game menu still works)");
     }

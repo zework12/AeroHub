@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Вход · AeroHub</title>
+<link rel="icon" href="img/icon.ico">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="ambient" aria-hidden="true"></div>
+<header class="top"><div class="wrap"><a class="brand" href="/"><span class="mark">A</span>AeroHub</a></div></header>
+<div class="page"><div class="wrap"><div class="auth">
+  <h1>Вход</h1>
+  <p class="sub">Нет аккаунта? <a href="/register">Регистрация</a></p>
+  <form id="f">
+    <label for="u">Логин</label><input id="u" name="username" autocomplete="username" required>
+    <label for="p">Пароль</label><input id="p" name="password" type="password" autocomplete="current-password" required>
+    <button class="btn primary" type="submit">Войти</button>
+    <div class="msg"></div>
+  </form>
+</div></div></div>
+<script src="app.js"></script>
+<script>
+bindForm(document.getElementById('f'), async (v) => {
+  const r = await api('/api/login', v);
+  if (!r.ok) throw new Error(r.data.error || 'Ошибка входа');
+  location.href = '/account';
+});
+</script>
+</body>
+</html>
